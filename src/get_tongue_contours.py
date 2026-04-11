@@ -224,9 +224,12 @@ def _find_mask_key(keys, substring: str) -> str:
     raise KeyError(f"No mask key containing '{substring}' in {list(keys)}")
 
 
-def extract_contours_for_video(mask_path: Path, video_path: Path) -> tuple:
+def extract_contours_for_video(mask_path: Path, video_path: Path | None) -> tuple:
     """
     Extract resampled upper tongue contours for all frames in a video.
+
+    video_path may be None if the video file is missing; FPS defaults to 30
+    and no video-derived information is used.
 
     Returns (contours_array, fps, tongue_masks).
     contours_array shape: (T, 2, N_POINTS) float32
@@ -241,12 +244,15 @@ def extract_contours_for_video(mask_path: Path, video_path: Path) -> tuple:
     # Compute fixed jaw anchor from median per-frame tongue-to-lower-lip junction
     jaw_ref = _find_jaw_anchor(tongue_masks, lower_lip_masks)
 
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0
-        print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
-    cap.release()
+    fps = 30.0
+    if video_path is not None:
+        cap = cv2.VideoCapture(str(video_path))
+        _fps = cap.get(cv2.CAP_PROP_FPS)
+        if _fps <= 0:
+            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
+        else:
+            fps = _fps
+        cap.release()
 
     contours = np.full((T, 2, N_POINTS), np.nan, dtype=np.float32)
 
@@ -354,6 +360,9 @@ def process_speaker(spk: str | None):
     contour_dir = base / "tongue_contours"
     diag_dir = contour_dir / "diagnostic"
 
+    if not video_dir.exists():
+        print(f"  Missing video_dir: {video_dir}")
+
     if spk is not None:
         mask_files = sorted(mask_dir.glob(f"{spk}_*.npz"))
     else:
@@ -380,12 +389,14 @@ def process_speaker(spk: str | None):
             basename = mask_path.stem
         video_path = video_dir / f"{basename}.avi"
 
-        if not video_path.exists():
+        video_missing = not video_path.exists()
+        if video_missing:
             print(f"    Missing video: {video_path}")
-            continue
 
         try:
-            contours, fps, tongue_masks = extract_contours_for_video(mask_path, video_path)
+            contours, fps, tongue_masks = extract_contours_for_video(
+                mask_path, None if video_missing else video_path
+            )
         except Exception as e:
             print(f"    ERROR extracting {mask_path.name}: {e}")
             continue
@@ -393,7 +404,7 @@ def process_speaker(spk: str | None):
         out_npy = contour_dir / f"{basename}.npy"
         np.save(out_npy, contours)
 
-        if mask_path.name in diag_set:
+        if mask_path.name in diag_set and not video_missing:
             diag_results[basename] = (contours, tongue_masks, video_path)
 
     # Write diagnostic videos
@@ -449,4 +460,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

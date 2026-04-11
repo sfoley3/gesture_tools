@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label, binary_erosion
 from sklearn.decomposition import PCA
+from statsmodels.nonparametric.smoothers_lowess import lowess
 from tqdm import tqdm
 
 # ── Load config ─────────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ SPK_BASE          = _cfg.get("spk_base", "")
 VIDEO_DIR         = _cfg.get("video_dir", "video")
 MAX_Y             = 104  # frame height for tongue root distance
 VELUM_PROCESSING  = _cfg.get("velum_processing", "")  # "pca" → 1D PC1 projection; empty → x,y
+SMOOTH            = bool(_cfg.get("smooth", False))
+LOESS_SPAN        = int(_cfg.get("loess_span", 50))
 
 # BGR colors — named for readability
 PURPLE    = (128, 0, 128)
@@ -65,6 +68,17 @@ DOT_RADIUS = 2
 
 
 # ── Kinematics helpers ──────────────────────────────────────────────────────
+
+def _loess_smooth(arr: np.ndarray, span: int = LOESS_SPAN) -> np.ndarray:
+    """Apply LOESS smoothing to a 1-D array. *span* is in frames, converted to a fraction of T."""
+    T = len(arr)
+    if T < 3:
+        return arr
+    frac = min(span / T, 1.0)
+    t = np.arange(T, dtype=np.float64)
+    smoothed = lowess(arr.astype(np.float64), t, frac=frac, return_sorted=False)
+    return smoothed.astype(np.float32)
+
 
 def _find_mask_key(keys, substring: str) -> str:
     """Find the first key in *keys* that contains *substring* (case-insensitive)."""
@@ -389,9 +403,12 @@ def compute_larynx_kinematics(larynx_masks: np.ndarray):
 
 # ── Main extraction ─────────────────────────────────────────────────────────
 
-def extract_kinematics(mask_path: Path, video_path: Path) -> tuple:
+def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     """
     Returns (kinematics_array, fps, tracked_points, mask_data).
+
+    video_path may be None if the video file is missing; FPS defaults to 30
+    and no video-derived information is used.
 
     If VELUM_PROCESSING == "pca":
         kinematics shape: (T, 6) — [velum_pc1, tt_dist, lip_aperture,
@@ -429,12 +446,15 @@ def extract_kinematics(mask_path: Path, video_path: Path) -> tuple:
     else:
         raise ValueError(f"No recognized masks in {mask_path}")
 
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0
-        print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
-    cap.release()
+    fps = 30.0
+    if video_path is not None:
+        cap = cv2.VideoCapture(str(video_path))
+        _fps = cap.get(cv2.CAP_PROP_FPS)
+        if _fps <= 0:
+            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
+        else:
+            fps = _fps
+        cap.release()
 
     # Initialize columns as NaN
     vx = np.full(T, np.nan, dtype=np.float32)
@@ -488,6 +508,11 @@ def extract_kinematics(mask_path: Path, video_path: Path) -> tuple:
         kinematics = np.stack([velum_pc1, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
     else:
         kinematics = np.stack([vx, vy, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
+
+    if SMOOTH:
+        for col in range(kinematics.shape[1]):
+            if not np.all(np.isnan(kinematics[:, col])):
+                kinematics[:, col] = _loess_smooth(kinematics[:, col])
 
     return kinematics, fps, tracked_points, data
 
@@ -612,12 +637,13 @@ def write_diagnostic_video(
 # ── Per-speaker processing ──────────────────────────────────────────────────
 
 def _discover_speakers() -> list:
-    """List speaker directories matching SPK_BASE* under DATA_DIR."""
+    """List speaker directories matching SPK_BASE* under DATA_DIR that have masks."""
     if not SPK_BASE:
         return []
     return sorted(
         d.name for d in DATA_DIR.iterdir()
         if d.is_dir() and d.name.startswith(SPK_BASE)
+        and (d / "sam_seg" / "masks").is_dir()
     )
 
 
@@ -635,8 +661,11 @@ def process_speaker(spk: str | None):
 
     mask_dir = base / "sam_seg" / "masks"
     video_dir = base / VIDEO_DIR
-    kin_dir = base / "sam_seg" / "kinematics"
-    diag_dir = base / "sam_seg" / "diagnostic"
+    kin_dir = base / "kinematics"
+    diag_dir = kin_dir / "diagnostic"
+
+    if not video_dir.exists():
+        print(f"  Missing video_dir: {video_dir}")
 
     # In multi-speaker mode, masks are prefixed with speaker name
     if spk is not None:
@@ -656,7 +685,7 @@ def process_speaker(spk: str | None):
     diag_files = rng.sample(mask_files, min(N_DIAGNOSTIC, len(mask_files)))
     diag_set = set(f.name for f in diag_files)
 
-    results = {}  # basename → (kinematics, fps, tracked_points, mask_data)
+    results = {}  # basename → (kinematics, fps, tracked_points, mask_data, video_path)
 
     for mask_path in tqdm(mask_files, desc=f"  {label} kinematics"):
         if spk is not None:
@@ -666,12 +695,14 @@ def process_speaker(spk: str | None):
             basename = mask_path.stem
         video_path = video_dir / f"{basename}.avi"
 
-        if not video_path.exists():
+        video_missing = not video_path.exists()
+        if video_missing:
             print(f"    Missing video: {video_path}")
-            continue
 
         try:
-            kin, fps, tracked_pts, mask_data = extract_kinematics(mask_path, video_path)
+            kin, fps, tracked_pts, mask_data = extract_kinematics(
+                mask_path, None if video_missing else video_path
+            )
         except Exception as e:
             print(f"    ERROR extracting {mask_path.name}: {e}")
             continue
@@ -679,7 +710,7 @@ def process_speaker(spk: str | None):
         out_npy = kin_dir / f"{basename}.npy"
         np.save(out_npy, kin)
 
-        if mask_path.name in diag_set:
+        if mask_path.name in diag_set and not video_missing:
             results[basename] = (kin, fps, tracked_pts, mask_data, video_path)
 
     # Write diagnostic videos
