@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-# ABOUTME: Extracts articulatory kinematics (velum, tongue tip, lip aperture, tongue body, tongue root) from SAM2 mask NPZ files.
-# ABOUTME: Outputs per-video NPY timeseries (T, 6) and diagnostic MP4 overlays with color-coded tracked points.
+# ABOUTME: Extracts articulatory kinematics (velum, tongue tip, lip aperture, tongue body, tongue root, larynx) from SAM2 mask NPZ files.
+# ABOUTME: Outputs per-video NPY timeseries (T, 7) and diagnostic MP4 overlays with color-coded tracked points.
 """
 Processes SAM2 segmentation masks to extract raw articulatory kinematic timeseries.
-Smoothing and velocity computation are handled downstream in get_sam_gestures.py.
 
 For each speaker × video:
   - Velum: tip position (x, y) in 104×104 pixel space — right-half centroid of largest component
   - Tongue tip: distance to alveolar ridge reference point
   - Lip aperture: distance between closest points on lower lip and upper lip masks
   - Tongue body: distance from closest tongue pixel to leftmost velum pixel (per-frame)
-  - Tongue root: x-coordinate of rightmost tongue pixel
+  - Tongue root: distance from rightmost tongue pixel y-coordinate to max y (104)
+  - Larynx: y-coordinate of mask centroid
 
-Output NPY shape: (T, 6) — [velum_x, velum_y, tt_dist, lip_aperture, tongue_body_dist, tongue_root_x]
+Output NPY shape: (T, 7) — [velum_x, velum_y, tt_dist, lip_aperture, tongue_body_dist, tongue_root_dist, larynx_y]
+
+Reads config.json from the project root for data_dir, n_diagnostic, spk_base, video_dir.
+If spk_base is empty, single-speaker mode (no speaker subdirectories).
+Otherwise, speakers are {spk_base}{number} and can be specified via --spk with just numbers.
 
 Usage:
-    conda run -n myenv python extract_mask_kinematics.py [--spk spk1 spk2 ...]
+    conda run -n myenv python extract_mask_kinematics.py [--spk 2 3 ...]
 """
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -27,11 +32,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label, binary_erosion
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 
-DATA_DIR     = Path("/data1/span_data/prompt/data/mri")
-ALL_SPEAKERS = ["spk2", "spk3", "spk4", "spk5", "spk6", "spk7", "spk8", "spk9", "spk10"]
-N_DIAGNOSTIC = 5
+# ── Load config ─────────────────────────────────────────────────────────────
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+with open(_CONFIG_PATH) as _f:
+    _cfg = json.load(_f)
+
+DATA_DIR          = Path(_cfg["data_dir"])
+N_DIAGNOSTIC      = int(_cfg.get("n_diagnostic", 10))
+SPK_BASE          = _cfg.get("spk_base", "")
+VIDEO_DIR         = _cfg.get("video_dir", "video")
+MAX_Y             = 104  # frame height for tongue root distance
+VELUM_PROCESSING  = _cfg.get("velum_processing", "")  # "pca" → 1D PC1 projection; empty → x,y
 
 # BGR colors — named for readability
 PURPLE    = (128, 0, 128)
@@ -59,6 +73,12 @@ def _find_mask_key(keys, substring: str) -> str:
         if sub in k.lower():
             return k
     raise KeyError(f"No mask key containing '{substring}' in {list(keys)}")
+
+
+def _has_mask_key(keys, substring: str) -> bool:
+    """Return True if any key in *keys* contains *substring* (case-insensitive)."""
+    sub = substring.lower()
+    return any(sub in k.lower() for k in keys)
 
 
 def _fill_nans(arr: np.ndarray) -> np.ndarray:
@@ -131,6 +151,17 @@ def _erode_to_thick_part(mask: np.ndarray, min_pixels: int = 20) -> np.ndarray:
 #     return _fill_nans(x), _fill_nans(y)
 
 
+def _velum_pca_project(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    Fit PCA on the (x, y) velum centroids and project onto PC1.
+    Returns a 1D array of shape (T,), float32.
+    """
+    xy = np.stack([x, y], axis=1)  # (T, 2)
+    pca = PCA(n_components=1)
+    proj = pca.fit_transform(xy).ravel().astype(np.float32)  # (T,)
+    return proj
+
+
 def compute_velum_kinematics(velum_masks: np.ndarray):
     """
     velum_masks: (T, H, W) bool
@@ -155,7 +186,6 @@ def compute_velum_kinematics(velum_masks: np.ndarray):
                 y[t] = ys[right].mean()
 
     return _fill_nans(x), _fill_nans(y)
-
 
 def _find_alveolar_ridge(palate_masks: np.ndarray) -> tuple:
     """
@@ -304,14 +334,15 @@ def compute_tongue_body(tongue_masks: np.ndarray, velum_masks: np.ndarray):
     return dist, tongue_pts, velum_pts
 
 
-def compute_tongue_root(tongue_masks: np.ndarray):
+def compute_tongue_root(tongue_masks: np.ndarray, max_y: int = MAX_Y):
     """
     tongue_masks: (T, H, W) bool
     Tracks the rightmost point on the tongue mask each frame.
-    Returns (x_arr, root_points) — x_arr is (T,), root_points is (T, 2).
+    Returns the vertical distance from that point's y-coordinate to max_y (frame height).
+    Returns (dist_arr, root_points) — dist_arr is (T,), root_points is (T, 2).
     """
     T = tongue_masks.shape[0]
-    x_arr = np.full(T, np.nan, dtype=np.float32)
+    dist_arr = np.full(T, np.nan, dtype=np.float32)
     root_pts = np.full((T, 2), np.nan, dtype=np.float32)
 
     for t in range(T):
@@ -325,29 +356,78 @@ def compute_tongue_root(tongue_masks: np.ndarray):
         root_x = float(x_max)
         root_y = float(col_ys.mean())
 
-        x_arr[t] = root_x
+        dist_arr[t] = float(max_y) - root_y
         root_pts[t] = [root_x, root_y]
 
-    x_arr = _fill_nans(x_arr)
+    dist_arr = _fill_nans(dist_arr)
     root_pts = _fill_nans_2d(root_pts)
-    return x_arr, root_pts
+    return dist_arr, root_pts
 
+
+def compute_larynx_kinematics(larynx_masks: np.ndarray):
+    """
+    larynx_masks: (T, H, W) bool
+    Tracks the y-coordinate of the mask centroid at each frame.
+    Returns (y_arr, center_points) — y_arr is (T,), center_points is (T, 2).
+    """
+    T = larynx_masks.shape[0]
+    y_arr = np.full(T, np.nan, dtype=np.float32)
+    center_pts = np.full((T, 2), np.nan, dtype=np.float32)
+
+    for t in range(T):
+        m = larynx_masks[t]
+        if not m.any():
+            continue
+        ys, xs = np.where(m)
+        center_pts[t] = [float(xs.mean()), float(ys.mean())]
+        y_arr[t] = float(ys.mean())
+
+    y_arr = _fill_nans(y_arr)
+    center_pts = _fill_nans_2d(center_pts)
+    return y_arr, center_pts
+
+
+# ── Main extraction ─────────────────────────────────────────────────────────
 
 def extract_kinematics(mask_path: Path, video_path: Path) -> tuple:
     """
     Returns (kinematics_array, fps, tracked_points, mask_data).
-    kinematics_array shape: (T, 6) — [velum_x, velum_y, tt_dist, lip_aperture,
-                                        tongue_body_dist, tongue_root_x]
+
+    If VELUM_PROCESSING == "pca":
+        kinematics shape: (T, 6) — [velum_pc1, tt_dist, lip_aperture,
+                                     tongue_body_dist, tongue_root_dist, larynx_y]
+    Otherwise:
+        kinematics shape: (T, 7) — [velum_x, velum_y, tt_dist, lip_aperture,
+                                     tongue_body_dist, tongue_root_dist, larynx_y]
+
+    Only computes kinematics for masks that are present in the NPZ.
+    Missing columns are filled with NaN.
     tracked_points: dict of per-feature point arrays for diagnostic drawing.
     """
     data = np.load(mask_path)
     keys = list(data.keys())
-    velum_masks = data["velum"]
-    tongue_masks = data["tongue"]
-    palate_key = _find_mask_key(keys, "upper lip")
-    lower_lip_key = _find_mask_key(keys, "lower lip")
-    palate_masks = data[palate_key]
-    lower_lip_masks = data[lower_lip_key]
+
+    # Determine which masks are available
+    has_velum = _has_mask_key(keys, "velum")
+    has_tongue = _has_mask_key(keys, "tongue")
+    has_upper_lip = _has_mask_key(keys, "upper lip")
+    has_lower_lip = _has_mask_key(keys, "lower lip")
+    has_larynx = _has_mask_key(keys, "larynx")
+
+    # Load available masks
+    velum_masks = data[_find_mask_key(keys, "velum")] if has_velum else None
+    tongue_masks = data[_find_mask_key(keys, "tongue")] if has_tongue else None
+    palate_masks = data[_find_mask_key(keys, "upper lip")] if has_upper_lip else None
+    lower_lip_masks = data[_find_mask_key(keys, "lower lip")] if has_lower_lip else None
+    larynx_masks = data[_find_mask_key(keys, "larynx")] if has_larynx else None
+
+    # Determine T from whichever mask is present
+    for m in [velum_masks, tongue_masks, palate_masks, lower_lip_masks, larynx_masks]:
+        if m is not None:
+            T = m.shape[0]
+            break
+    else:
+        raise ValueError(f"No recognized masks in {mask_path}")
 
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -356,25 +436,58 @@ def extract_kinematics(mask_path: Path, video_path: Path) -> tuple:
         print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
     cap.release()
 
-    vx, vy = compute_velum_kinematics(velum_masks)
-    tt_dist, tt_points, alveolar_ridge = compute_tt_kinematics(tongue_masks, palate_masks)
-    la_dist, la_upper_pts, la_lower_pts = compute_lip_aperture(lower_lip_masks, palate_masks)
-    tb_dist, tb_tongue_pts, tb_velum_pts = compute_tongue_body(tongue_masks, velum_masks)
-    tr_x, tr_root_pts = compute_tongue_root(tongue_masks)
+    # Initialize columns as NaN
+    vx = np.full(T, np.nan, dtype=np.float32)
+    vy = np.full(T, np.nan, dtype=np.float32)
+    tt_dist = np.full(T, np.nan, dtype=np.float32)
+    la_dist = np.full(T, np.nan, dtype=np.float32)
+    tb_dist = np.full(T, np.nan, dtype=np.float32)
+    tr_dist = np.full(T, np.nan, dtype=np.float32)
+    larynx_y = np.full(T, np.nan, dtype=np.float32)
 
-    kinematics = np.stack([vx, vy, tt_dist, la_dist, tb_dist, tr_x], axis=1).astype(np.float32)
-    velum_centroids = np.stack([vx, vy], axis=1)
+    tracked_points = {}
 
-    tracked_points = {
-        "velum_centroids": velum_centroids,
-        "tt_points": tt_points,
-        "alveolar_ridge": alveolar_ridge,
-        "la_upper_pts": la_upper_pts,
-        "la_lower_pts": la_lower_pts,
-        "tb_tongue_pts": tb_tongue_pts,
-        "tb_velum_pts": tb_velum_pts,
-        "tr_root_pts": tr_root_pts,
-    }
+    # Velum
+    velum_pc1 = np.full(T, np.nan, dtype=np.float32)
+    if has_velum:
+        vx, vy = compute_velum_kinematics(velum_masks)
+        tracked_points["velum_centroids"] = np.stack([vx, vy], axis=1)
+        if VELUM_PROCESSING == "pca":
+            velum_pc1 = _velum_pca_project(vx, vy)
+
+    # Tongue tip (needs tongue + upper lip / palate)
+    tt_points = None
+    if has_tongue and has_upper_lip:
+        tt_dist, tt_points, alveolar_ridge = compute_tt_kinematics(tongue_masks, palate_masks)
+        tracked_points["tt_points"] = tt_points
+        tracked_points["alveolar_ridge"] = alveolar_ridge
+
+    # Lip aperture (needs lower lip + upper lip)
+    if has_lower_lip and has_upper_lip:
+        la_dist, la_upper_pts, la_lower_pts = compute_lip_aperture(lower_lip_masks, palate_masks)
+        tracked_points["la_upper_pts"] = la_upper_pts
+        tracked_points["la_lower_pts"] = la_lower_pts
+
+    # Tongue body (needs tongue + velum)
+    if has_tongue and has_velum:
+        tb_dist, tb_tongue_pts, tb_velum_pts = compute_tongue_body(tongue_masks, velum_masks)
+        tracked_points["tb_tongue_pts"] = tb_tongue_pts
+        tracked_points["tb_velum_pts"] = tb_velum_pts
+
+    # Tongue root (needs tongue)
+    if has_tongue:
+        tr_dist, tr_root_pts = compute_tongue_root(tongue_masks)
+        tracked_points["tr_root_pts"] = tr_root_pts
+
+    # Larynx
+    if has_larynx:
+        larynx_y, larynx_pts = compute_larynx_kinematics(larynx_masks)
+        tracked_points["larynx_pts"] = larynx_pts
+
+    if VELUM_PROCESSING == "pca":
+        kinematics = np.stack([velum_pc1, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
+    else:
+        kinematics = np.stack([vx, vy, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
 
     return kinematics, fps, tracked_points, data
 
@@ -404,27 +517,35 @@ def write_diagnostic_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_w, frame_h))
 
-    mask_h, mask_w = mask_data["velum"].shape[1], mask_data["velum"].shape[2]
-
-    velum_centroids = tracked_points["velum_centroids"]
-    tt_points       = tracked_points["tt_points"]
-    alveolar_ridge  = tracked_points["alveolar_ridge"]
-    la_upper_pts    = tracked_points["la_upper_pts"]
-    la_lower_pts    = tracked_points["la_lower_pts"]
-    tb_tongue_pts   = tracked_points["tb_tongue_pts"]
-    tb_velum_pts    = tracked_points["tb_velum_pts"]
-    tr_root_pts     = tracked_points["tr_root_pts"]
-
+    # Get mask dimensions from whichever mask is available
     all_keys = list(mask_data.keys())
-    # Build ordered (key, color) pairs; match by substring for lip masks
-    region_colors = [
-        ("velum", PURPLE),
-        ("tongue", BLUE),
-        (_find_mask_key(all_keys, "upper lip"), GREEN),
-        (_find_mask_key(all_keys, "lower lip"), ORANGE),
-    ]
+    mask_h = mask_w = None
+    for k in all_keys:
+        arr = mask_data[k]
+        if hasattr(arr, 'shape') and arr.ndim == 3:
+            mask_h, mask_w = arr.shape[1], arr.shape[2]
+            break
+    if mask_h is None:
+        cap.release()
+        writer.release()
+        return
+
+    # Build region color list only for present masks
+    region_colors = []
+    if _has_mask_key(all_keys, "velum"):
+        region_colors.append((_find_mask_key(all_keys, "velum"), PURPLE))
+    if _has_mask_key(all_keys, "tongue"):
+        region_colors.append((_find_mask_key(all_keys, "tongue"), BLUE))
+    if _has_mask_key(all_keys, "upper lip"):
+        region_colors.append((_find_mask_key(all_keys, "upper lip"), GREEN))
+    if _has_mask_key(all_keys, "lower lip"):
+        region_colors.append((_find_mask_key(all_keys, "lower lip"), ORANGE))
+    if _has_mask_key(all_keys, "larynx"):
+        region_colors.append((_find_mask_key(all_keys, "larynx"), CYAN))
 
     def _draw_dot(frame, pts, t, color):
+        if pts is None:
+            return
         if t < len(pts):
             x, y = pts[t]
             if not (np.isnan(x) or np.isnan(y)):
@@ -439,8 +560,6 @@ def write_diagnostic_video(
         # Overlay masks
         overlay = frame.copy()
         for region, color in region_colors:
-            if region not in mask_data:
-                continue
             if t >= mask_data[region].shape[0]:
                 continue
             m = mask_data[region][t]
@@ -456,27 +575,33 @@ def write_diagnostic_video(
             frame = overlay.copy()
 
         # Velum centroid
-        _draw_dot(frame, velum_centroids, t, RED)
+        _draw_dot(frame, tracked_points.get("velum_centroids"), t, RED)
 
         # Tongue tip closest point
-        _draw_dot(frame, tt_points, t, RED)
+        _draw_dot(frame, tracked_points.get("tt_points"), t, RED)
 
         # Lip aperture: upper and lower closest points + connecting line
-        if t < len(la_upper_pts) and t < len(la_lower_pts):
-            ux, uy = la_upper_pts[t]
-            lx, ly = la_lower_pts[t]
-            if not (np.isnan(ux) or np.isnan(uy) or np.isnan(lx) or np.isnan(ly)):
-                p1 = _scale_point(ux, uy, mask_h, mask_w, frame_h, frame_w)
-                p2 = _scale_point(lx, ly, mask_h, mask_w, frame_h, frame_w)
-                cv2.circle(frame, p1, DOT_RADIUS, RED, -1)
-                cv2.circle(frame, p2, DOT_RADIUS, RED, -1)
-                cv2.line(frame, p1, p2, RED, 1)
+        la_upper_pts = tracked_points.get("la_upper_pts")
+        la_lower_pts = tracked_points.get("la_lower_pts")
+        if la_upper_pts is not None and la_lower_pts is not None:
+            if t < len(la_upper_pts) and t < len(la_lower_pts):
+                ux, uy = la_upper_pts[t]
+                lx, ly = la_lower_pts[t]
+                if not (np.isnan(ux) or np.isnan(uy) or np.isnan(lx) or np.isnan(ly)):
+                    p1 = _scale_point(ux, uy, mask_h, mask_w, frame_h, frame_w)
+                    p2 = _scale_point(lx, ly, mask_h, mask_w, frame_h, frame_w)
+                    cv2.circle(frame, p1, DOT_RADIUS, RED, -1)
+                    cv2.circle(frame, p2, DOT_RADIUS, RED, -1)
+                    cv2.line(frame, p1, p2, RED, 1)
 
         # Tongue body: closest tongue pixel to velum reference
-        _draw_dot(frame, tb_tongue_pts, t, RED)
+        _draw_dot(frame, tracked_points.get("tb_tongue_pts"), t, RED)
 
         # Tongue root: rightmost tongue point
-        _draw_dot(frame, tr_root_pts, t, RED)
+        _draw_dot(frame, tracked_points.get("tr_root_pts"), t, RED)
+
+        # Larynx: center point
+        _draw_dot(frame, tracked_points.get("larynx_pts"), t, RED)
 
         writer.write(frame)
 
@@ -486,29 +611,59 @@ def write_diagnostic_video(
 
 # ── Per-speaker processing ──────────────────────────────────────────────────
 
-def process_speaker(spk: str):
-    mask_dir = DATA_DIR / spk / "sam_seg" / "masks"
-    video_dir = DATA_DIR / spk / "video_split"
-    kin_dir = DATA_DIR / spk / "sam_seg" / "kinematics"
-    diag_dir = DATA_DIR / spk / "sam_seg" / "diagnostic"
+def _discover_speakers() -> list:
+    """List speaker directories matching SPK_BASE* under DATA_DIR."""
+    if not SPK_BASE:
+        return []
+    return sorted(
+        d.name for d in DATA_DIR.iterdir()
+        if d.is_dir() and d.name.startswith(SPK_BASE)
+    )
 
-    mask_files = sorted(mask_dir.glob(f"{spk}_*.npz"))
+
+def process_speaker(spk: str | None):
+    """
+    Process a single speaker. If spk is None (single-speaker mode),
+    paths are directly under DATA_DIR with no speaker subdirectory.
+    """
+    if spk is not None:
+        base = DATA_DIR / spk
+        label = spk
+    else:
+        base = DATA_DIR
+        label = DATA_DIR.name
+
+    mask_dir = base / "sam_seg" / "masks"
+    video_dir = base / VIDEO_DIR
+    kin_dir = base / "sam_seg" / "kinematics"
+    diag_dir = base / "sam_seg" / "diagnostic"
+
+    # In multi-speaker mode, masks are prefixed with speaker name
+    if spk is not None:
+        mask_files = sorted(mask_dir.glob(f"{spk}_*.npz"))
+    else:
+        mask_files = sorted(mask_dir.glob("*.npz"))
+
     if not mask_files:
-        print(f"  No mask files found for {spk}")
+        print(f"  No mask files found in {mask_dir}")
         return
 
     kin_dir.mkdir(parents=True, exist_ok=True)
 
-    # Select 5 random files for diagnostic videos (reproducible per speaker)
-    rng = random.Random(sum(ord(c) for c in spk))
+    # Select random files for diagnostic videos (reproducible)
+    seed = sum(ord(c) for c in label)
+    rng = random.Random(seed)
     diag_files = rng.sample(mask_files, min(N_DIAGNOSTIC, len(mask_files)))
     diag_set = set(f.name for f in diag_files)
 
     results = {}  # basename → (kinematics, fps, tracked_points, mask_data)
 
-    for mask_path in tqdm(mask_files, desc=f"  {spk} kinematics"):
-        # e.g. spk1_spk1_1.npz  →  basename = spk1_1
-        basename = mask_path.stem[len(spk) + 1:]  # strip "{spk}_" prefix
+    for mask_path in tqdm(mask_files, desc=f"  {label} kinematics"):
+        if spk is not None:
+            # e.g. spk1_spk1_1.npz  →  basename = spk1_1
+            basename = mask_path.stem[len(spk) + 1:]
+        else:
+            basename = mask_path.stem
         video_path = video_dir / f"{basename}.avi"
 
         if not video_path.exists():
@@ -531,10 +686,13 @@ def process_speaker(spk: str):
     if results:
         diag_dir.mkdir(parents=True, exist_ok=True)
         for basename, (kin, fps, tracked_pts, mask_data, video_path) in tqdm(
-            results.items(), desc=f"  {spk} diagnostic videos"
+            results.items(), desc=f"  {label} diagnostic videos"
         ):
             out_mp4 = diag_dir / f"{basename}_diagnostic.mp4"
-            mask_path = mask_dir / f"{spk}_{basename}.npz"
+            if spk is not None:
+                mask_path = mask_dir / f"{spk}_{basename}.npz"
+            else:
+                mask_path = mask_dir / f"{basename}.npz"
             try:
                 write_diagnostic_video(mask_path, video_path, out_mp4, tracked_pts, mask_data)
             except Exception as e:
@@ -544,19 +702,37 @@ def process_speaker(spk: str):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    single_speaker = not SPK_BASE
+
     parser = argparse.ArgumentParser(description="Extract mask kinematics from SAM2 NPZ files.")
-    parser.add_argument("--spk", nargs="+", default=ALL_SPEAKERS, metavar="SPK",
-                        help="Speakers to process (default: all)")
+    if not single_speaker:
+        parser.add_argument(
+            "--spk", nargs="+", type=int, default=None, metavar="N",
+            help=f"Speaker numbers to process, e.g. --spk 2 3 (prefix: '{SPK_BASE}'). Default: all."
+        )
     args = parser.parse_args()
 
-    for spk in args.spk:
-        if spk not in ALL_SPEAKERS:
-            print(f"Unknown speaker: {spk} (valid: {ALL_SPEAKERS})")
+    if single_speaker:
+        print(f"\n[{DATA_DIR.name}] (single speaker)")
+        process_speaker(None)
+    else:
+        all_speakers = _discover_speakers()
+        if not all_speakers:
+            print(f"No speaker directories matching '{SPK_BASE}*' found in {DATA_DIR}")
             sys.exit(1)
 
-    for spk in args.spk:
-        print(f"\n[{spk}]")
-        process_speaker(spk)
+        if args.spk is not None:
+            speakers = [f"{SPK_BASE}{n}" for n in args.spk]
+            for s in speakers:
+                if s not in all_speakers:
+                    print(f"Unknown speaker: {s} (valid: {all_speakers})")
+                    sys.exit(1)
+        else:
+            speakers = all_speakers
+
+        for spk in speakers:
+            print(f"\n[{spk}]")
+            process_speaker(spk)
 
     print("\nDone.")
 

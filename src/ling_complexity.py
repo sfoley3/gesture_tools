@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -28,8 +29,13 @@ from scipy.integrate import simpson
 from scipy.signal import butter, filtfilt
 from tqdm import tqdm
 
-DATA_DIR     = Path("/data1/span_data/prompt/data/mri")
-ALL_SPEAKERS = ["spk2", "spk3", "spk4", "spk5", "spk6", "spk7", "spk8", "spk9", "spk10"]
+# ── Load config ─────────────────────────────────────────────────────────────
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+with open(_CONFIG_PATH) as _f:
+    _cfg = json.load(_f)
+
+DATA_DIR  = Path(_cfg["data_dir"])
+SPK_BASE  = _cfg.get("spk_base", "")
 
 
 # ── MCI (Dawson 2016) ──────────────────────────────────────────────────────
@@ -222,21 +228,46 @@ def process_video(contour_path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 # ── Per-speaker processing ──────────────────────────────────────────────────
 
-def process_speaker(spk: str):
-    contour_dir = DATA_DIR / spk / "tongue_contours"
-    mci_dir     = DATA_DIR / spk / "mci"
-    ninfl_dir   = DATA_DIR / spk / "ninfl"
+def _discover_speakers() -> list:
+    """List speaker directories matching SPK_BASE* under DATA_DIR."""
+    if not SPK_BASE:
+        return []
+    return sorted(
+        d.name for d in DATA_DIR.iterdir()
+        if d.is_dir() and d.name.startswith(SPK_BASE)
+    )
 
-    contour_files = sorted(contour_dir.glob(f"{spk}_*.npy"))
+
+def process_speaker(spk: str | None):
+    """
+    Process a single speaker. If spk is None (single-speaker mode),
+    paths are directly under DATA_DIR with no speaker subdirectory.
+    """
+    if spk is not None:
+        base = DATA_DIR / spk
+        label = spk
+    else:
+        base = DATA_DIR
+        label = DATA_DIR.name
+
+    contour_dir = base / "tongue_contours"
+    mci_dir     = base / "mci"
+    ninfl_dir   = base / "ninfl"
+
+    if spk is not None:
+        contour_files = sorted(contour_dir.glob(f"{spk}_*.npy"))
+    else:
+        contour_files = sorted(contour_dir.glob("*.npy"))
+
     if not contour_files:
-        print(f"  No contour files found for {spk}")
+        print(f"  No contour files found in {contour_dir}")
         return
 
     mci_dir.mkdir(parents=True, exist_ok=True)
     ninfl_dir.mkdir(parents=True, exist_ok=True)
 
-    for contour_path in tqdm(contour_files, desc=f"  {spk}"):
-        basename = contour_path.stem  # e.g. spk2_fricatives1_sheep1
+    for contour_path in tqdm(contour_files, desc=f"  {label}"):
+        basename = contour_path.stem
         try:
             mci_arr, ninfl_arr = process_video(contour_path)
         except Exception as e:
@@ -250,19 +281,37 @@ def process_speaker(spk: str):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    single_speaker = not SPK_BASE
+
     parser = argparse.ArgumentParser(description="Extract MCI and NINFL from tongue contours.")
-    parser.add_argument("--spk", nargs="+", default=ALL_SPEAKERS, metavar="SPK",
-                        help="Speakers to process (default: all)")
+    if not single_speaker:
+        parser.add_argument(
+            "--spk", nargs="+", type=int, default=None, metavar="N",
+            help=f"Speaker numbers to process, e.g. --spk 2 3 (prefix: '{SPK_BASE}'). Default: all."
+        )
     args = parser.parse_args()
 
-    for spk in args.spk:
-        if spk not in ALL_SPEAKERS:
-            print(f"Unknown speaker: {spk} (valid: {ALL_SPEAKERS})")
+    if single_speaker:
+        print(f"\n[{DATA_DIR.name}] (single speaker)")
+        process_speaker(None)
+    else:
+        all_speakers = _discover_speakers()
+        if not all_speakers:
+            print(f"No speaker directories matching '{SPK_BASE}*' found in {DATA_DIR}")
             sys.exit(1)
 
-    for spk in args.spk:
-        print(f"\n[{spk}]")
-        process_speaker(spk)
+        if args.spk is not None:
+            speakers = [f"{SPK_BASE}{n}" for n in args.spk]
+            for s in speakers:
+                if s not in all_speakers:
+                    print(f"Unknown speaker: {s} (valid: {all_speakers})")
+                    sys.exit(1)
+        else:
+            speakers = all_speakers
+
+        for spk in speakers:
+            print(f"\n[{spk}]")
+            process_speaker(spk)
 
     print("\nDone.")
 

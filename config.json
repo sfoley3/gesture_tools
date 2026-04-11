@@ -1,0 +1,7 @@
+{
+  "data_dir":    "/data1/span_data/usc_lss",
+  "n_diagnostic": 10,
+  "spk_base": "",
+  "video_dir": "video",
+  "velum_processing": "pca"
+}

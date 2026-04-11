@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import json
 import random
 import sys
 from pathlib import Path
@@ -31,9 +32,15 @@ import numpy as np
 from scipy.ndimage import label
 from tqdm import tqdm
 
-DATA_DIR     = Path("/data1/span_data/prompt/data/mri")
-ALL_SPEAKERS = ["spk2", "spk3", "spk4", "spk5", "spk6", "spk7", "spk8", "spk9", "spk10"]
-N_DIAGNOSTIC = 10
+# ── Load config ─────────────────────────────────────────────────────────────
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+with open(_CONFIG_PATH) as _f:
+    _cfg = json.load(_f)
+
+DATA_DIR     = Path(_cfg["data_dir"])
+N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 10))
+SPK_BASE     = _cfg.get("spk_base", "")
+VIDEO_DIR    = _cfg.get("video_dir", "video")
 N_POINTS     = 100
 
 # BGR colors
@@ -320,28 +327,57 @@ def write_diagnostic_video(
 
 # ── Per-speaker processing ──────────────────────────────────────────────────
 
-def process_speaker(spk: str):
-    mask_dir = DATA_DIR / spk / "sam_seg" / "masks"
-    video_dir = DATA_DIR / spk / "video_split"
-    contour_dir = DATA_DIR / spk / "tongue_contours"
+def _discover_speakers() -> list:
+    """List speaker directories matching SPK_BASE* under DATA_DIR."""
+    if not SPK_BASE:
+        return []
+    return sorted(
+        d.name for d in DATA_DIR.iterdir()
+        if d.is_dir() and d.name.startswith(SPK_BASE)
+    )
+
+
+def process_speaker(spk: str | None):
+    """
+    Process a single speaker. If spk is None (single-speaker mode),
+    paths are directly under DATA_DIR with no speaker subdirectory.
+    """
+    if spk is not None:
+        base = DATA_DIR / spk
+        label = spk
+    else:
+        base = DATA_DIR
+        label = DATA_DIR.name
+
+    mask_dir = base / "sam_seg" / "masks"
+    video_dir = base / VIDEO_DIR
+    contour_dir = base / "tongue_contours"
     diag_dir = contour_dir / "diagnostic"
 
-    mask_files = sorted(mask_dir.glob(f"{spk}_*.npz"))
+    if spk is not None:
+        mask_files = sorted(mask_dir.glob(f"{spk}_*.npz"))
+    else:
+        mask_files = sorted(mask_dir.glob("*.npz"))
+
     if not mask_files:
-        print(f"  No mask files found for {spk}")
+        print(f"  No mask files found in {mask_dir}")
         return
 
     contour_dir.mkdir(parents=True, exist_ok=True)
 
-    # Select 5 random files for diagnostic videos (reproducible per speaker)
-    rng = random.Random(sum(ord(c) for c in spk))
+    # Select random files for diagnostic videos (reproducible)
+    seed = sum(ord(c) for c in label)
+    rng = random.Random(seed)
     diag_files = rng.sample(mask_files, min(N_DIAGNOSTIC, len(mask_files)))
     diag_set = set(f.name for f in diag_files)
 
     diag_results = {}
 
-    for mask_path in tqdm(mask_files, desc=f"  {spk} contours"):
-        basename = mask_path.stem[len(spk) + 1:]  # strip "{spk}_" prefix
+    for mask_path in tqdm(mask_files, desc=f"  {label} contours"):
+        if spk is not None:
+            basename = mask_path.stem[len(spk) + 1:]
+        else:
+            basename = mask_path.stem
         video_path = video_dir / f"{basename}.avi"
 
         if not video_path.exists():
@@ -364,7 +400,7 @@ def process_speaker(spk: str):
     if diag_results:
         diag_dir.mkdir(parents=True, exist_ok=True)
         for basename, (contours, tongue_masks, video_path) in tqdm(
-            diag_results.items(), desc=f"  {spk} diagnostic videos"
+            diag_results.items(), desc=f"  {label} diagnostic videos"
         ):
             out_mp4 = diag_dir / f"{basename}_contour_diagnostic.mp4"
             try:
@@ -376,19 +412,37 @@ def process_speaker(spk: str):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    single_speaker = not SPK_BASE
+
     parser = argparse.ArgumentParser(description="Extract tongue contours from SAM2 NPZ files.")
-    parser.add_argument("--spk", nargs="+", default=ALL_SPEAKERS, metavar="SPK",
-                        help="Speakers to process (default: all)")
+    if not single_speaker:
+        parser.add_argument(
+            "--spk", nargs="+", type=int, default=None, metavar="N",
+            help=f"Speaker numbers to process, e.g. --spk 2 3 (prefix: '{SPK_BASE}'). Default: all."
+        )
     args = parser.parse_args()
 
-    for spk in args.spk:
-        if spk not in ALL_SPEAKERS:
-            print(f"Unknown speaker: {spk} (valid: {ALL_SPEAKERS})")
+    if single_speaker:
+        print(f"\n[{DATA_DIR.name}] (single speaker)")
+        process_speaker(None)
+    else:
+        all_speakers = _discover_speakers()
+        if not all_speakers:
+            print(f"No speaker directories matching '{SPK_BASE}*' found in {DATA_DIR}")
             sys.exit(1)
 
-    for spk in args.spk:
-        print(f"\n[{spk}]")
-        process_speaker(spk)
+        if args.spk is not None:
+            speakers = [f"{SPK_BASE}{n}" for n in args.spk]
+            for s in speakers:
+                if s not in all_speakers:
+                    print(f"Unknown speaker: {s} (valid: {all_speakers})")
+                    sys.exit(1)
+        else:
+            speakers = all_speakers
+
+        for spk in speakers:
+            print(f"\n[{spk}]")
+            process_speaker(spk)
 
     print("\nDone.")
 
