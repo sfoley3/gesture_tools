@@ -45,7 +45,8 @@ DATA_DIR          = Path(_cfg["data_dir"])
 N_DIAGNOSTIC      = int(_cfg.get("n_diagnostic", 10))
 SPK_BASE          = _cfg.get("spk_base", "")
 VIDEO_DIR         = _cfg.get("video_dir", "video")
-MAX_Y             = 104  # frame height for tongue root distance
+DATSET            = _cfg.get("dataset", "lss")
+MAX_Y             = 104  
 VELUM_PROCESSING  = _cfg.get("velum_processing", "")  # "pca" → 1D PC1 projection; empty → x,y
 SMOOTH            = bool(_cfg.get("smooth", False))
 LOESS_SPAN        = int(_cfg.get("loess_span", 50))
@@ -446,12 +447,12 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     else:
         raise ValueError(f"No recognized masks in {mask_path}")
 
-    fps = 30.0
+    fps = 50.0
     if video_path is not None:
         cap = cv2.VideoCapture(str(video_path))
         _fps = cap.get(cv2.CAP_PROP_FPS)
         if _fps <= 0:
-            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
+            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 50")
         else:
             fps = _fps
         cap.release()
@@ -473,6 +474,7 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
         vx, vy = compute_velum_kinematics(velum_masks)
         tracked_points["velum_centroids"] = np.stack([vx, vy], axis=1)
         if VELUM_PROCESSING == "pca":
+            vx, vy = _loess_smooth(vx), _loess_smooth(vy)
             velum_pc1 = _velum_pca_project(vx, vy)
 
     # Tongue tip (needs tongue + upper lip / palate)
@@ -510,9 +512,14 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
         kinematics = np.stack([vx, vy, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
 
     if SMOOTH:
-        for col in range(kinematics.shape[1]):
-            if not np.all(np.isnan(kinematics[:, col])):
-                kinematics[:, col] = _loess_smooth(kinematics[:, col])
+        if VELUM_PROCESSING == "pca":
+            for col in range(1, kinematics.shape[1]):  # skip col 0 (velum_pc1, already smoothed)
+                if not np.all(np.isnan(kinematics[:, col])):
+                    kinematics[:, col] = _loess_smooth(kinematics[:, col])
+        else:
+            for col in range(kinematics.shape[1]):
+                if not np.all(np.isnan(kinematics[:, col])):
+                    kinematics[:, col] = _loess_smooth(kinematics[:, col])
 
     return kinematics, fps, tracked_points, data
 
@@ -527,33 +534,44 @@ def _scale_point(x: float, y: float, mask_h: int, mask_w: int, frame_h: int, fra
 
 def write_diagnostic_video(
     mask_path: Path,
-    video_path: Path,
+    video_path: Path | None,
     out_path: Path,
     tracked_points: dict,
     mask_data: dict,
 ):
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    """Write a diagnostic MP4 with color-coded mask overlays and tracked points.
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_w, frame_h))
-
-    # Get mask dimensions from whichever mask is available
+    If video_path is None (video file missing), synthesizes black frames from the
+    mask dimensions and uses FPS=50, so diagnostics are always produced.
+    """
+    # Get mask dimensions and frame count from whichever mask is available
     all_keys = list(mask_data.keys())
     mask_h = mask_w = None
+    n_frames_mask = 0
     for k in all_keys:
         arr = mask_data[k]
         if hasattr(arr, 'shape') and arr.ndim == 3:
             mask_h, mask_w = arr.shape[1], arr.shape[2]
+            n_frames_mask = arr.shape[0]
             break
     if mask_h is None:
-        cap.release()
-        writer.release()
         return
+
+    if video_path is not None:
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 50.0
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    else:
+        cap = None
+        fps = 50.0
+        frame_h, frame_w = mask_h, mask_w
+        n_frames = n_frames_mask
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_w, frame_h))
 
     # Build region color list only for present masks
     region_colors = []
@@ -578,9 +596,12 @@ def write_diagnostic_video(
                 cv2.circle(frame, (px, py), DOT_RADIUS, color, -1)
 
     for t in range(n_frames):
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if cap is not None:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        else:
+            frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
 
         # Overlay masks
         overlay = frame.copy()
@@ -630,7 +651,8 @@ def write_diagnostic_video(
 
         writer.write(frame)
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     writer.release()
 
 
@@ -659,9 +681,13 @@ def process_speaker(spk: str | None):
         base = DATA_DIR
         label = DATA_DIR.name
 
-    mask_dir = base / "sam_seg" / "masks"
+    mask_dir = base  / "sam_seg" / "masks"
     video_dir = base / VIDEO_DIR
     kin_dir = base / "kinematics"
+    pts_dir = kin_dir / "pts"
+    pts_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = kin_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
     diag_dir = kin_dir / "diagnostic"
 
     if not video_dir.exists():
@@ -707,11 +733,15 @@ def process_speaker(spk: str | None):
             print(f"    ERROR extracting {mask_path.name}: {e}")
             continue
 
-        out_npy = kin_dir / f"{basename}.npy"
-        np.save(out_npy, kin)
+        out_pts_npy = pts_dir /f"{basename}.npy"
+        np.save(out_pts_npy, kin)
 
-        if mask_path.name in diag_set and not video_missing:
-            results[basename] = (kin, fps, tracked_pts, mask_data, video_path)
+        out_raw_json = raw_dir /f"{basename}.json"
+        with open(out_raw_json , "w") as f:
+            json.dump(tracked_pts, f, indent=4, default=lambda o: o.tolist() if isinstance(o, np.ndarray) else o)
+
+        if mask_path.name in diag_set:
+            results[basename] = (kin, fps, tracked_pts, mask_data, None if video_missing else video_path)
 
     # Write diagnostic videos
     if results:

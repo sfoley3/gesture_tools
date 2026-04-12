@@ -1,9 +1,9 @@
 {
-  "data_dir":    "/data1/seanfole/speech_inv/eval_results/split_predictions",
+  "data_dir":    "/data1/span_data/prompt/data/mri",
   "n_diagnostic": 10,
-  "spk_base": "",
-  "video_dir": "",
+  "spk_base": "spk",
+  "video_dir": "video_split",
   "velum_processing": "pca",
-  "smooth": false,
+  "smooth": true,
   "loess_span": 50
 }

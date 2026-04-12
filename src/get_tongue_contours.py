@@ -244,12 +244,12 @@ def extract_contours_for_video(mask_path: Path, video_path: Path | None) -> tupl
     # Compute fixed jaw anchor from median per-frame tongue-to-lower-lip junction
     jaw_ref = _find_jaw_anchor(tongue_masks, lower_lip_masks)
 
-    fps = 30.0
+    fps = 50.0
     if video_path is not None:
         cap = cv2.VideoCapture(str(video_path))
         _fps = cap.get(cv2.CAP_PROP_FPS)
         if _fps <= 0:
-            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 30")
+            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 50")
         else:
             fps = _fps
         cap.release()
@@ -275,33 +275,44 @@ def extract_contours_for_video(mask_path: Path, video_path: Path | None) -> tupl
 # ── Diagnostic video ────────────────────────────────────────────────────────
 
 def write_diagnostic_video(
-    video_path: Path,
+    video_path: Path | None,
     out_path: Path,
     contours: np.ndarray,
     tongue_masks: np.ndarray,
 ):
-    """
-    Write a diagnostic MP4 with tongue mask overlay (blue) and contour line (red).
+    """Write a diagnostic MP4 with tongue mask overlay (blue) and contour line (red).
 
     contours: (T, 2, N_POINTS) float32 in mask pixel space (104×104)
     tongue_masks: (T, H, W) bool
-    """
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    If video_path is None (video file missing), synthesizes black frames from the
+    mask dimensions and uses FPS=50, so diagnostics are always produced.
+    """
     mask_h, mask_w = tongue_masks.shape[1], tongue_masks.shape[2]
+
+    if video_path is not None:
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 50.0
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    else:
+        cap = None
+        fps = 50.0
+        frame_h, frame_w = mask_h, mask_w
+        n_frames = tongue_masks.shape[0]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_w, frame_h))
 
     for t in range(n_frames):
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if cap is not None:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        else:
+            frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
 
         # Overlay tongue mask in blue
         if t < tongue_masks.shape[0] and tongue_masks[t].any():
@@ -327,7 +338,8 @@ def write_diagnostic_video(
 
         writer.write(frame)
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     writer.release()
 
 
@@ -404,8 +416,8 @@ def process_speaker(spk: str | None):
         out_npy = contour_dir / f"{basename}.npy"
         np.save(out_npy, contours)
 
-        if mask_path.name in diag_set and not video_missing:
-            diag_results[basename] = (contours, tongue_masks, video_path)
+        if mask_path.name in diag_set:
+            diag_results[basename] = (contours, tongue_masks, None if video_missing else video_path)
 
     # Write diagnostic videos
     if diag_results:
