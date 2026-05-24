@@ -3,6 +3,8 @@
   "n_diagnostic": 10,
   "spk_base": "spk",
   "video_dir": "video_split",
+  "textgrid_dir": "textgrid_split",
+  "audio_dir": "audio_split",
   "velum_processing": "pca",
   "smooth": true,
   "loess_span": 50
