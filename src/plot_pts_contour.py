@@ -2,22 +2,6 @@
 # ABOUTME: Plots a randomly selected MRI frame as a side-by-side PDF panel — left: frame + region mask overlays + tracked articulator points; right: frame + region mask overlays + upper tongue contour.
 # ABOUTME: Reads config.json for data_dir / spk_base / video_dir; loads pre-extracted masks (NPZ), contours (NPY), and tracked points (JSON).
 """
-For one randomly selected video × frame in a speaker's data directory, render a
-two-panel PDF over the original MRI frame:
-
-  Left  : MRI frame + raw region-mask overlays + bright-red tracked points
-          (velum centroid, TT, TB-tongue, TR-root, and the upper/lower lip
-           reference pair connected by a line)
-  Right : MRI frame + raw region-mask overlays + the upper tongue contour
-
-No axes, ticks, or titles. Coordinates live in 104×104 mask pixel space; the
-MRI frame is loaded from the corresponding .avi and resized to 104×104.
-
-A new random video × frame is chosen on every run (unless --seed is passed),
-and any existing PDFs in the output directory are deleted first.
-
-Single-speaker mode is used when `spk_base` is empty in config.json.
-Otherwise pass `--spk N` to choose speaker `{spk_base}{N}`.
 
 Usage:
     conda run -n myenv python plot_pts_contour.py [--output-dir DIR] [--spk N] [--seed S]
@@ -62,8 +46,8 @@ REGION_DEFS = [
 
 MASK_ALPHA  = 0.5
 POINT_COLOR = "#ff1744"   # bright red for overlays
-POINT_SIZE  = 60
-LINE_WIDTH  = 5.0
+POINT_SIZE  = 80
+LINE_WIDTH  = 3.0
 CONTOUR_LW  = 5.0
 
 
@@ -133,6 +117,151 @@ def draw_right_overlay(ax, contour_frame):
         return
     ax.plot(xs[valid], ys[valid], color=POINT_COLOR,
             linewidth=CONTOUR_LW, zorder=5)
+
+
+def _ordered_loops(mask):
+    """Ordered (N, 2) float arrays — one per external contour loop."""
+    if mask is None or not mask.any():
+        return []
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    return [c.squeeze(1).astype(np.float32) for c in contours if len(c) >= 2]
+
+
+def _arc_between(loop, i, j):
+    """The two arcs of a cyclic loop running from index i to index j
+    (forward and backward)."""
+    n = len(loop)
+    if i == j:
+        return loop[i:i + 1], loop[i:i + 1]
+    fwd_idx = [(i + k) % n for k in range(((j - i) % n) + 1)]
+    bwd_idx = [(i - k) % n for k in range(((i - j) % n) + 1)]
+    return loop[fwd_idx], loop[bwd_idx]
+
+
+def _arc_containing(loop, i, j, t):
+    """Return the arc i→j (cyclic) that contains index t."""
+    n = len(loop)
+    fwd_len = (j - i) % n
+    on_fwd  = (t - i) % n <= fwd_len
+    fwd_idx = [(i + k) % n for k in range(fwd_len + 1)]
+    bwd_idx = [(i - k) % n for k in range(((i - j) % n) + 1)]
+    return loop[fwd_idx] if on_fwd else loop[bwd_idx]
+
+
+def _tongue_front_endpoint(contour_frame):
+    """Return (x, y) of the tongue contour endpoint with the smaller x
+    (front / tip in face-left MRI) — i.e. the bottom-left endpoint."""
+    if contour_frame is None:
+        return None
+    xs = np.asarray(contour_frame[0])
+    ys = np.asarray(contour_frame[1])
+    valid = ~(np.isnan(xs) | np.isnan(ys))
+    if valid.sum() < 1:
+        return None
+    xv, yv = xs[valid], ys[valid]
+    return (float(xv[0]), float(yv[0])) if xv[0] <= xv[-1] \
+        else (float(xv[-1]), float(yv[-1]))
+
+
+def _draw_bottom_arc(ax, mask):
+    """Trace the bottom (high-y / airway-facing) edge of `mask` as one
+    continuous red polyline. Used for upper-lip + palate and for velum."""
+    arc = _bottom_arc_ordered(mask)
+    if arc is None:
+        return
+    ax.plot(arc[:, 0], arc[:, 1], color=POINT_COLOR,
+            linewidth=CONTOUR_LW, zorder=5)
+
+
+def _bottom_arc_ordered(mask):
+    """Bottom (airway-facing) arc of a mask, oriented front (low x) → back
+    (high x). Returns None if unavailable."""
+    loops = _ordered_loops(mask)
+    if not loops:
+        return None
+    loop = max(loops, key=len)
+    L = int(np.argmin(loop[:, 0]))   # front (leftmost)
+    R = int(np.argmax(loop[:, 0]))   # back  (rightmost)
+    fwd, bwd = _arc_between(loop, L, R)
+    arc = fwd if fwd[:, 1].mean() > bwd[:, 1].mean() else bwd
+    if len(arc) < 2:
+        return None
+    if arc[0, 0] > arc[-1, 0]:
+        arc = arc[::-1]
+    return arc
+
+
+def _join_front_back_arcs(front, back):
+    """Trim overlap and concatenate two front-to-back arcs into one
+    contiguous polyline. A straight segment auto-bridges any small gap."""
+    if front is None:
+        return back
+    if back is None:
+        return front
+    f_max = float(front[-1, 0])
+    b_min = float(back[0, 0])
+    if f_max >= b_min:
+        cut = 0.5 * (f_max + b_min)
+        front = front[front[:, 0] <= cut]
+        back  = back[back[:,   0] >= cut]
+        if len(front) < 1 or len(back) < 1:
+            return front if len(front) >= len(back) else back
+    return np.vstack([front, back])
+
+
+def _draw_lower_lip_jaw(ax, mask, tongue_front):
+    """Trace lower-lip / jaw mask from the bottom of its left (front) edge
+    upward, over the top, around any inner curl, and down the right edge —
+    stopping where it meets the tongue contour's front (bottom-left) end.
+    Skips the under-jaw arc entirely."""
+    loops = _ordered_loops(mask)
+    if not loops:
+        return
+    loop = max(loops, key=len)
+    # Start L: bottom-most point of the jaw mask (argmax y). On an L-shaped
+    # jaw this lies at the under-jaw extreme; the arc-through-top selector
+    # then walks the full diagonal outer edge up to the lip front.
+    L = int(np.argmax(loop[:, 1]))
+    # Stop R: closest loop point to tongue contour's front endpoint.
+    if tongue_front is not None:
+        d = np.linalg.norm(loop - np.asarray(tongue_front,
+                                              dtype=np.float32), axis=1)
+        R = int(np.argmin(d))
+    else:
+        R = int(np.argmin(loop[:, 1]))  # fallback: topmost point
+    # Pick the arc that passes through the mask's topmost (min-y) point.
+    T = int(np.argmin(loop[:, 1]))
+    if T in (L, R):
+        fwd, bwd = _arc_between(loop, L, R)
+        arc = fwd if fwd[:, 1].mean() < bwd[:, 1].mean() else bwd
+    else:
+        arc = _arc_containing(loop, L, R, T)
+    if len(arc) >= 2:
+        ax.plot(arc[:, 0], arc[:, 1], color=POINT_COLOR,
+                linewidth=CONTOUR_LW, zorder=5)
+
+
+def draw_outer_overlay(ax, region_by_name, contour_frame):
+    """Composite outer airway contour as a single thick red trace."""
+    if contour_frame is not None:
+        xs = np.asarray(contour_frame[0])
+        ys = np.asarray(contour_frame[1])
+        valid = ~(np.isnan(xs) | np.isnan(ys))
+        if valid.sum() >= 2:
+            ax.plot(xs[valid], ys[valid], color=POINT_COLOR,
+                    linewidth=CONTOUR_LW, zorder=5)
+
+    lip_arc = _bottom_arc_ordered(region_by_name.get("upper lip"))
+    vel_arc = _bottom_arc_ordered(region_by_name.get("velum"))
+    combined = _join_front_back_arcs(lip_arc, vel_arc)
+    if combined is not None and len(combined) >= 2:
+        ax.plot(combined[:, 0], combined[:, 1], color=POINT_COLOR,
+                linewidth=CONTOUR_LW, zorder=5)
+    if "lower lip" in region_by_name:
+        _draw_lower_lip_jaw(ax, region_by_name["lower lip"],
+                            _tongue_front_endpoint(contour_frame))
 
 
 # ── Data discovery ─────────────────────────────────────────────────────────
@@ -242,11 +371,14 @@ def main():
     t = rng.randrange(T)
 
     region_frames = []
+    region_by_name = {}
     for rd in REGION_DEFS:
         key = _find_mask_key(keys, rd["substring"])
         if key is None:
             continue
-        region_frames.append((rd["color"], npz[key][t]))
+        mask_t = npz[key][t]
+        region_frames.append((rd["color"], mask_t))
+        region_by_name[rd["substring"]] = mask_t
 
     contours_all  = np.load(contour_dir / f"{basename}.npy")
     contour_frame = contours_all[t] if t < len(contours_all) else None
@@ -262,16 +394,17 @@ def main():
     mri = _load_mri_frame(video_path, t)
 
     # ── Plot ────────────────────────────────────────────────────────────────
-    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(12, 6))
+    fig, (ax_l, ax_m, ax_r) = plt.subplots(1, 3, figsize=(18, 6))
 
-    for ax in (ax_l, ax_r):
+    for ax in (ax_l, ax_m, ax_r):
         ax.imshow(mri, cmap="gray", interpolation="nearest")
         overlay_masks(ax, region_frames)
 
     draw_left_overlay(ax_l, pts, t)
-    draw_right_overlay(ax_r, contour_frame)
+    draw_right_overlay(ax_m, contour_frame)
+    draw_outer_overlay(ax_r, region_by_name, contour_frame)
 
-    for ax in (ax_l, ax_r):
+    for ax in (ax_l, ax_m, ax_r):
         ax.set_aspect("equal")
         ax.axis("off")
         ax.set_xlim(-0.5, STANDARD_SIZE - 0.5)

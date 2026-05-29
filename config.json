@@ -1,10 +1,10 @@
 {
-  "data_dir":    "/data1/span_data/prompt/data/mri",
+  "data_dir":    "/data1/span_data/usc_lss",
   "n_diagnostic": 10,
-  "spk_base": "spk",
-  "video_dir": "video_split",
-  "textgrid_dir": "textgrid_split",
-  "audio_dir": "audio_split",
+  "spk_base": "",
+  "video_dir": "video",
+  "textgrid_dir": "",
+  "audio_dir": "audio",
   "velum_processing": "pca",
   "smooth": true,
   "loess_span": 50
