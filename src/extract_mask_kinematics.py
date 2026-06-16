@@ -46,7 +46,7 @@ N_DIAGNOSTIC      = int(_cfg.get("n_diagnostic", 10))
 SPK_BASE          = _cfg.get("spk_base", "")
 VIDEO_DIR         = _cfg.get("video_dir", "video")
 DATSET            = _cfg.get("dataset", "lss")
-MAX_Y             = 104  
+MAX_X             = 104  
 VELUM_PROCESSING  = _cfg.get("velum_processing", "")  # "pca" → 1D PC1 projection; empty → x,y
 SMOOTH            = bool(_cfg.get("smooth", False))
 LOESS_SPAN        = int(_cfg.get("loess_span", 50))
@@ -349,11 +349,11 @@ def compute_tongue_body(tongue_masks: np.ndarray, velum_masks: np.ndarray):
     return dist, tongue_pts, velum_pts
 
 
-def compute_tongue_root(tongue_masks: np.ndarray, max_y: int = MAX_Y):
+def compute_tongue_root(tongue_masks: np.ndarray, MAX_X: int = MAX_X):
     """
     tongue_masks: (T, H, W) bool
     Tracks the rightmost point on the tongue mask each frame.
-    Returns the vertical distance from that point's y-coordinate to max_y (frame height).
+    Returns the vertical distance from that point's x-coordinate to MAX_X (frame width).
     Returns (dist_arr, root_points) — dist_arr is (T,), root_points is (T, 2).
     """
     T = tongue_masks.shape[0]
@@ -371,7 +371,7 @@ def compute_tongue_root(tongue_masks: np.ndarray, max_y: int = MAX_Y):
         root_x = float(x_max)
         root_y = float(col_ys.mean())
 
-        dist_arr[t] = float(max_y) - root_y
+        dist_arr[t] = float(MAX_X) - root_x
         root_pts[t] = [root_x, root_y]
 
     dist_arr = _fill_nans(dist_arr)
