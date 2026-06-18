@@ -37,9 +37,43 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 from tqdm import tqdm
 
 # ── Load config ─────────────────────────────────────────────────────────────
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
-with open(_CONFIG_PATH) as _f:
-    _cfg = json.load(_f)
+# Defaults let the module import cleanly when pip-installed (no repo-root
+# config.json present). They mirror the values used to generate the reference
+# kinematics, so importing the extraction functions Just Works out of the box.
+_DEFAULT_CFG = {
+    "data_dir":         ".",
+    "n_diagnostic":     10,
+    "spk_base":         "",
+    "video_dir":        "video",
+    "dataset":          "lss",
+    "velum_processing": "pca",
+    "smooth":           True,
+    "loess_span":       50,
+}
+
+
+def _load_config() -> dict:
+    """Load config.json, falling back gracefully so imports never crash.
+
+    Search order:
+      1. Path in the GESTURE_TOOLS_CONFIG environment variable, if set.
+      2. config.json at the repo root (next to the package) — dev/clone layout.
+    Missing keys are filled from _DEFAULT_CFG; if no file is found the defaults
+    are used in full.
+    """
+    candidates = []
+    env_path = os.environ.get("GESTURE_TOOLS_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(__file__).resolve().parent.parent / "config.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            with open(candidate) as _f:
+                return {**_DEFAULT_CFG, **json.load(_f)}
+    return dict(_DEFAULT_CFG)
+
+
+_cfg = _load_config()
 
 DATA_DIR          = Path(_cfg["data_dir"])
 N_DIAGNOSTIC      = int(_cfg.get("n_diagnostic", 10))

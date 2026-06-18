@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -33,9 +34,38 @@ from scipy.ndimage import label
 from tqdm import tqdm
 
 # ── Load config ─────────────────────────────────────────────────────────────
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
-with open(_CONFIG_PATH) as _f:
-    _cfg = json.load(_f)
+# Defaults let the module import cleanly when pip-installed (no repo-root
+# config.json present), so importing the extraction functions Just Works.
+_DEFAULT_CFG = {
+    "data_dir":     ".",
+    "n_diagnostic": 10,
+    "spk_base":     "",
+    "video_dir":    "video",
+}
+
+
+def _load_config() -> dict:
+    """Load config.json, falling back gracefully so imports never crash.
+
+    Search order:
+      1. Path in the GESTURE_TOOLS_CONFIG environment variable, if set.
+      2. config.json at the repo root (next to the package) — dev/clone layout.
+    Missing keys are filled from _DEFAULT_CFG; if no file is found the defaults
+    are used in full.
+    """
+    candidates = []
+    env_path = os.environ.get("GESTURE_TOOLS_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path(__file__).resolve().parent.parent / "config.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            with open(candidate) as _f:
+                return {**_DEFAULT_CFG, **json.load(_f)}
+    return dict(_DEFAULT_CFG)
+
+
+_cfg = _load_config()
 
 DATA_DIR     = Path(_cfg["data_dir"])
 N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 10))
@@ -224,7 +254,7 @@ def _find_mask_key(keys, substring: str) -> str:
     raise KeyError(f"No mask key containing '{substring}' in {list(keys)}")
 
 
-def extract_contours_for_video(mask_path: Path, video_path: Path | None) -> tuple:
+def extract_contours(mask_path: Path, video_path: Path | None) -> tuple:
     """
     Extract resampled upper tongue contours for all frames in a video.
 
@@ -406,7 +436,7 @@ def process_speaker(spk: str | None):
             print(f"    Missing video: {video_path}")
 
         try:
-            contours, fps, tongue_masks = extract_contours_for_video(
+            contours, fps, tongue_masks = extract_contours(
                 mask_path, None if video_missing else video_path
             )
         except Exception as e:

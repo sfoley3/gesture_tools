@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gesture_tools"
+version = "0.1.0"
+description = "Extract articulatory kinematics and tongue contours from SAM2 segmentation masks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "scipy",
+    "scikit-learn",
+    "statsmodels",
+    "matplotlib",
+    "tqdm",
+]
+
+[project.scripts]
+extract-mask-kinematics = "extract_mask_kinematics:main"
+get-tongue-contours = "get_tongue_contours:main"
+
+# The modules import each other as top-level names (e.g.
+# `from extract_mask_kinematics import extract_kinematics`), so they are
+# installed as flat top-level modules rather than under a package namespace.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = [
+    "extract_mask_kinematics",
+    "get_tongue_contours",
+    "plot_tongue",
+    "ssanova",
+    "get_tt_region",
+    "ling_complexity",
+    "summarize_complexity",
+    "plot_pts_contour",
+]
