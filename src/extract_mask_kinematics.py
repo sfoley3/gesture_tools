@@ -31,7 +31,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.ndimage import distance_transform_edt, label, binary_erosion
+from scipy.ndimage import binary_erosion, label
 from sklearn.decomposition import PCA
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from tqdm import tqdm
@@ -41,14 +41,14 @@ from tqdm import tqdm
 # config.json present). They mirror the values used to generate the reference
 # kinematics, so importing the extraction functions Just Works out of the box.
 _DEFAULT_CFG = {
-    "data_dir":         ".",
-    "n_diagnostic":     10,
-    "spk_base":         "",
-    "video_dir":        "video",
-    "dataset":          "lss",
+    "data_dir": ".",
+    "n_diagnostic": 10,
+    "spk_base": "",
+    "video_dir": "video",
+    "dataset": "lss",
     "velum_processing": "pca",
-    "smooth":           True,
-    "loess_span":       50,
+    "smooth": True,
+    "loess_span": 50,
 }
 
 
@@ -75,27 +75,29 @@ def _load_config() -> dict:
 
 _cfg = _load_config()
 
-DATA_DIR          = Path(_cfg["data_dir"])
-N_DIAGNOSTIC      = int(_cfg.get("n_diagnostic", 10))
-SPK_BASE          = _cfg.get("spk_base", "")
-VIDEO_DIR         = _cfg.get("video_dir", "video")
-DATSET            = _cfg.get("dataset", "lss")
-MAX_X             = 104  
-VELUM_PROCESSING  = _cfg.get("velum_processing", "")  # "pca" → 1D PC1 projection; empty → x,y
-SMOOTH            = bool(_cfg.get("smooth", False))
-LOESS_SPAN        = int(_cfg.get("loess_span", 50))
+DATA_DIR = Path(_cfg["data_dir"])
+N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 10))
+SPK_BASE = _cfg.get("spk_base", "")
+VIDEO_DIR = _cfg.get("video_dir", "video")
+DATSET = _cfg.get("dataset", "lss")
+MAX_X = 104
+VELUM_PROCESSING = _cfg.get(
+    "velum_processing", ""
+)  # "pca" → 1D PC1 projection; empty → x,y
+SMOOTH = bool(_cfg.get("smooth", False))
+LOESS_SPAN = int(_cfg.get("loess_span", 50))
 
 # BGR colors — named for readability
-PURPLE    = (128, 0, 128)
-BLUE      = (200, 100, 0)
-GREEN     = (50, 180, 0)
-DARK_RED  = (180, 50, 50)
-RED       = (0, 0, 255)
-YELLOW    = (0, 255, 255)
-CYAN      = (255, 255, 0)
-MAGENTA   = (255, 0, 255)
-ORANGE    = (0, 165, 255)
-WHITE     = (255, 255, 255)
+PURPLE = (128, 0, 128)
+BLUE = (200, 100, 0)
+GREEN = (50, 180, 0)
+DARK_RED = (180, 50, 50)
+RED = (0, 0, 255)
+YELLOW = (0, 255, 255)
+CYAN = (255, 255, 0)
+MAGENTA = (255, 0, 255)
+ORANGE = (0, 165, 255)
+WHITE = (255, 255, 255)
 
 
 MASK_ALPHA = 0.80
@@ -103,6 +105,7 @@ DOT_RADIUS = 2
 
 
 # ── Kinematics helpers ──────────────────────────────────────────────────────
+
 
 def _loess_smooth(arr: np.ndarray, span: int = LOESS_SPAN) -> np.ndarray:
     """Apply LOESS smoothing to a 1-D array. *span* is in frames, converted to a fraction of T."""
@@ -152,6 +155,7 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
     sizes = np.bincount(labeled.ravel())
     sizes[0] = 0  # ignore background
     return labeled == sizes.argmax()
+
 
 def _erode_to_thick_part(mask: np.ndarray, min_pixels: int = 20) -> np.ndarray:
     """
@@ -236,6 +240,7 @@ def compute_velum_kinematics(velum_masks: np.ndarray):
 
     return _fill_nans(x), _fill_nans(y)
 
+
 def _find_alveolar_ridge(palate_masks: np.ndarray) -> tuple:
     """
     Derive a fixed alveolar ridge reference point from the time-averaged palate mask.
@@ -305,6 +310,26 @@ def _fill_nans_2d(arr: np.ndarray) -> np.ndarray:
     return out
 
 
+def compute_jaw_point(lower_lip_masks: np.ndarray) -> np.ndarray:
+    """
+    Per-frame bottom-left "elbow" of the lower-lip / jaw mask.
+    Picks the mask pixel that is furthest down-and-left, i.e. the
+    convex-hull vertex in the (-x, +y) direction. Returns (T, 2)
+    float32, forward/back-filled across NaN rows.
+    """
+    T = lower_lip_masks.shape[0]
+    pts = np.full((T, 2), np.nan, dtype=np.float32)
+    for t in range(T):
+        m = lower_lip_masks[t]
+        if not m.any():
+            continue
+        ys, xs = np.where(m)
+        i = int(np.argmax(ys.astype(np.int32) - xs.astype(np.int32)))
+        pts[t, 0] = float(xs[i])
+        pts[t, 1] = float(ys[i])
+    return _fill_nans_2d(pts)
+
+
 def compute_lip_aperture(lower_lip_masks: np.ndarray, palate_masks: np.ndarray):
     """
     lower_lip_masks, palate_masks: (T, H, W) bool
@@ -327,9 +352,9 @@ def compute_lip_aperture(lower_lip_masks: np.ndarray, palate_masks: np.ndarray):
         ly, lx = np.where(ll)
 
         # Brute-force closest pair via broadcasting
-        dx = ux[:, None] - lx[None, :]   # (Nu, Nl)
+        dx = ux[:, None] - lx[None, :]  # (Nu, Nl)
         dy = uy[:, None] - ly[None, :]
-        d2 = dx ** 2 + dy ** 2
+        d2 = dx**2 + dy**2
         idx_flat = d2.argmin()
         i_u, i_l = np.unravel_index(idx_flat, d2.shape)
 
@@ -438,6 +463,7 @@ def compute_larynx_kinematics(larynx_masks: np.ndarray):
 
 # ── Main extraction ─────────────────────────────────────────────────────────
 
+
 def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     """
     Returns (kinematics_array, fps, tracked_points, mask_data).
@@ -486,7 +512,9 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
         cap = cv2.VideoCapture(str(video_path))
         _fps = cap.get(cv2.CAP_PROP_FPS)
         if _fps <= 0:
-            print(f"    Warning: could not read FPS from {video_path.name}, defaulting to 50")
+            print(
+                f"    Warning: could not read FPS from {video_path.name}, defaulting to 50"
+            )
         else:
             fps = _fps
         cap.release()
@@ -514,19 +542,25 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     # Tongue tip (needs tongue + upper lip / palate)
     tt_points = None
     if has_tongue and has_upper_lip:
-        tt_dist, tt_points, alveolar_ridge = compute_tt_kinematics(tongue_masks, palate_masks)
+        tt_dist, tt_points, alveolar_ridge = compute_tt_kinematics(
+            tongue_masks, palate_masks
+        )
         tracked_points["tt_points"] = tt_points
         tracked_points["alveolar_ridge"] = alveolar_ridge
 
     # Lip aperture (needs lower lip + upper lip)
     if has_lower_lip and has_upper_lip:
-        la_dist, la_upper_pts, la_lower_pts = compute_lip_aperture(lower_lip_masks, palate_masks)
+        la_dist, la_upper_pts, la_lower_pts = compute_lip_aperture(
+            lower_lip_masks, palate_masks
+        )
         tracked_points["la_upper_pts"] = la_upper_pts
         tracked_points["la_lower_pts"] = la_lower_pts
 
     # Tongue body (needs tongue + velum)
     if has_tongue and has_velum:
-        tb_dist, tb_tongue_pts, tb_velum_pts = compute_tongue_body(tongue_masks, velum_masks)
+        tb_dist, tb_tongue_pts, tb_velum_pts = compute_tongue_body(
+            tongue_masks, velum_masks
+        )
         tracked_points["tb_tongue_pts"] = tb_tongue_pts
         tracked_points["tb_velum_pts"] = tb_velum_pts
 
@@ -540,14 +574,23 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
         larynx_y, larynx_pts = compute_larynx_kinematics(larynx_masks)
         tracked_points["larynx_pts"] = larynx_pts
 
+    jaw_pts = compute_jaw_point(lower_lip_masks) if has_lower_lip else None
+    tracked_points["jaw_pts"] = jaw_pts
+
     if VELUM_PROCESSING == "pca":
-        kinematics = np.stack([velum_pc1, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
+        kinematics = np.stack(
+            [velum_pc1, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1
+        ).astype(np.float32)
     else:
-        kinematics = np.stack([vx, vy, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1).astype(np.float32)
+        kinematics = np.stack(
+            [vx, vy, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1
+        ).astype(np.float32)
 
     if SMOOTH:
         if VELUM_PROCESSING == "pca":
-            for col in range(1, kinematics.shape[1]):  # skip col 0 (velum_pc1, already smoothed)
+            for col in range(
+                1, kinematics.shape[1]
+            ):  # skip col 0 (velum_pc1, already smoothed)
                 if not np.all(np.isnan(kinematics[:, col])):
                     kinematics[:, col] = _loess_smooth(kinematics[:, col])
         else:
@@ -560,7 +603,10 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
 
 # ── Diagnostic video ────────────────────────────────────────────────────────
 
-def _scale_point(x: float, y: float, mask_h: int, mask_w: int, frame_h: int, frame_w: int):
+
+def _scale_point(
+    x: float, y: float, mask_h: int, mask_w: int, frame_h: int, frame_w: int
+):
     sx = int(round(x * frame_w / mask_w))
     sy = int(round(y * frame_h / mask_h))
     return sx, sy
@@ -584,7 +630,7 @@ def write_diagnostic_video(
     n_frames_mask = 0
     for k in all_keys:
         arr = mask_data[k]
-        if hasattr(arr, 'shape') and arr.ndim == 3:
+        if hasattr(arr, "shape") and arr.ndim == 3:
             mask_h, mask_w = arr.shape[1], arr.shape[2]
             n_frames_mask = arr.shape[0]
             break
@@ -646,8 +692,9 @@ def write_diagnostic_video(
             if not m.any():
                 continue
             m_resized = cv2.resize(
-                m.astype(np.uint8) * 255, (frame_w, frame_h),
-                interpolation=cv2.INTER_NEAREST
+                m.astype(np.uint8) * 255,
+                (frame_w, frame_h),
+                interpolation=cv2.INTER_NEAREST,
             )
             colored = np.zeros_like(frame)
             colored[m_resized > 0] = color
@@ -692,13 +739,16 @@ def write_diagnostic_video(
 
 # ── Per-speaker processing ──────────────────────────────────────────────────
 
+
 def _discover_speakers() -> list:
     """List speaker directories matching SPK_BASE* under DATA_DIR that have masks."""
     if not SPK_BASE:
         return []
     return sorted(
-        d.name for d in DATA_DIR.iterdir()
-        if d.is_dir() and d.name.startswith(SPK_BASE)
+        d.name
+        for d in DATA_DIR.iterdir()
+        if d.is_dir()
+        and d.name.startswith(SPK_BASE)
         and (d / "sam_seg" / "masks").is_dir()
     )
 
@@ -715,7 +765,7 @@ def process_speaker(spk: str | None):
         base = DATA_DIR
         label = DATA_DIR.name
 
-    mask_dir = base  / "sam_seg" / "masks"
+    mask_dir = base / "sam_seg" / "masks"
     video_dir = base / VIDEO_DIR
     kin_dir = base / "kinematics"
     pts_dir = kin_dir / "pts"
@@ -750,7 +800,7 @@ def process_speaker(spk: str | None):
     for mask_path in tqdm(mask_files, desc=f"  {label} kinematics"):
         if spk is not None:
             # e.g. spk1_spk1_1.npz  →  basename = spk1_1
-            basename = mask_path.stem[len(spk) + 1:]
+            basename = mask_path.stem[len(spk) + 1 :]
         else:
             basename = mask_path.stem
         video_path = video_dir / f"{basename}.avi"
@@ -767,15 +817,26 @@ def process_speaker(spk: str | None):
             print(f"    ERROR extracting {mask_path.name}: {e}")
             continue
 
-        out_pts_npy = pts_dir /f"{basename}.npy"
+        out_pts_npy = pts_dir / f"{basename}.npy"
         np.save(out_pts_npy, kin)
 
-        out_raw_json = raw_dir /f"{basename}.json"
-        with open(out_raw_json , "w") as f:
-            json.dump(tracked_pts, f, indent=4, default=lambda o: o.tolist() if isinstance(o, np.ndarray) else o)
+        out_raw_json = raw_dir / f"{basename}.json"
+        with open(out_raw_json, "w") as f:
+            json.dump(
+                tracked_pts,
+                f,
+                indent=4,
+                default=lambda o: o.tolist() if isinstance(o, np.ndarray) else o,
+            )
 
         if mask_path.name in diag_set:
-            results[basename] = (kin, fps, tracked_pts, mask_data, None if video_missing else video_path)
+            results[basename] = (
+                kin,
+                fps,
+                tracked_pts,
+                mask_data,
+                None if video_missing else video_path,
+            )
 
     # Write diagnostic videos
     if results:
@@ -789,21 +850,30 @@ def process_speaker(spk: str | None):
             else:
                 mask_path = mask_dir / f"{basename}.npz"
             try:
-                write_diagnostic_video(mask_path, video_path, out_mp4, tracked_pts, mask_data)
+                write_diagnostic_video(
+                    mask_path, video_path, out_mp4, tracked_pts, mask_data
+                )
             except Exception as e:
                 print(f"    ERROR writing diagnostic video {basename}: {e}")
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
+
 def main():
     single_speaker = not SPK_BASE
 
-    parser = argparse.ArgumentParser(description="Extract mask kinematics from SAM2 NPZ files.")
+    parser = argparse.ArgumentParser(
+        description="Extract mask kinematics from SAM2 NPZ files."
+    )
     if not single_speaker:
         parser.add_argument(
-            "--spk", nargs="+", type=int, default=None, metavar="N",
-            help=f"Speaker numbers to process, e.g. --spk 2 3 (prefix: '{SPK_BASE}'). Default: all."
+            "--spk",
+            nargs="+",
+            type=int,
+            default=None,
+            metavar="N",
+            help=f"Speaker numbers to process, e.g. --spk 2 3 (prefix: '{SPK_BASE}'). Default: all.",
         )
     args = parser.parse_args()
 
