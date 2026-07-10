@@ -91,17 +91,18 @@ MAX_XY = 104
 # Region key substrings (case-insensitive). Pharyngeal wall auto-detects "pharyn".
 # There is no larynx/glottis mask; the posterior end of the tract is defined by
 # the bottom of the tongue and its closest point on the pharyngeal wall.
-ROOF_FRONT_SUB = "upper lip"   # "upper lip - palate"
+ROOF_FRONT_SUB = "upper lip"  # "upper lip - palate"
 VELUM_SUB = "velum"
-PHARYNX_SUB = "pharyn"         # "pharyngeal wall"
+PHARYNX_SUB = "pharyn"  # "pharyngeal wall"
 TONGUE_SUB = "tongue"
-LOWER_LIP_SUB = "lower lip"    # "lower lip - jaw"
+LOWER_LIP_SUB = "lower lip"  # "lower lip - jaw"
 
 # The five segmented regions, in canonical order.
 REGION_SUBS = [ROOF_FRONT_SUB, VELUM_SUB, PHARYNX_SUB, TONGUE_SUB, LOWER_LIP_SUB]
 
 
 # ── Mask-key helpers ─────────────────────────────────────────────────────────
+
 
 def _find_mask_key(keys, substring: str):
     sub = substring.lower()
@@ -124,6 +125,7 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
 # (self-contained ports of the helpers in get_tongue_contours.py and
 #  plot_pts_contour.py, so this tool runs standalone.)
 
+
 def _ordered_loops(mask):
     if mask is None or not mask.any():
         return []
@@ -136,7 +138,7 @@ def _ordered_loops(mask):
 def _arc_between(loop, i, j):
     n = len(loop)
     if i == j:
-        return loop[i:i + 1], loop[i:i + 1]
+        return loop[i : i + 1], loop[i : i + 1]
     fwd_idx = [(i + k) % n for k in range(((j - i) % n) + 1)]
     bwd_idx = [(i - k) % n for k in range(((i - j) % n) + 1)]
     return loop[fwd_idx], loop[bwd_idx]
@@ -168,8 +170,8 @@ def _anterior_arc_ordered(mask):
     if not loops:
         return None
     loop = max(loops, key=len)
-    T = int(np.argmin(loop[:, 1]))   # top
-    B = int(np.argmax(loop[:, 1]))   # bottom
+    T = int(np.argmin(loop[:, 1]))  # top
+    B = int(np.argmax(loop[:, 1]))  # bottom
     fwd, bwd = _arc_between(loop, T, B)
     # airway-facing arc has the smaller mean x (anterior side)
     arc = fwd if fwd[:, 0].mean() < bwd[:, 0].mean() else bwd
@@ -217,9 +219,9 @@ def _tongue_airway_arc(mask):
     if not loops:
         return None
     loop = max(loops, key=len)
-    L = int(np.argmin(loop[:, 0]))    # tip (front)
-    B = int(np.argmax(loop[:, 1]))    # bottom (posterior-inferior)
-    Tp = int(np.argmin(loop[:, 1]))   # airway-facing apex (top)
+    L = int(np.argmin(loop[:, 0]))  # tip (front)
+    B = int(np.argmax(loop[:, 1]))  # bottom (posterior-inferior)
+    Tp = int(np.argmin(loop[:, 1]))  # airway-facing apex (top)
     if Tp in (L, B):
         fwd, bwd = _arc_between(loop, L, B)
         arc = fwd if fwd[:, 1].mean() < bwd[:, 1].mean() else bwd
@@ -227,7 +229,7 @@ def _tongue_airway_arc(mask):
         arc = _arc_containing(loop, L, B, Tp)
     if len(arc) < 2:
         return None
-    if arc[0, 0] > arc[-1, 0]:         # front (low x) first
+    if arc[0, 0] > arc[-1, 0]:  # front (low x) first
         arc = arc[::-1]
     return arc
 
@@ -294,6 +296,7 @@ def trace_floor(region_by_sub: dict):
 
 # ── Landmarks (all mask-derived) ─────────────────────────────────────────────
 
+
 def _aggregate_occupancy(mask_stack: np.ndarray, thresh: float = 0.15) -> np.ndarray:
     """Time-average a (T,H,W) mask into a representative binary occupancy map."""
     if mask_stack is None:
@@ -353,7 +356,7 @@ def _lips_point(palate_agg, lower_lip_agg):
         lx, ly = lx[lx_m], ly[lx_m]
     dx = ux[:, None] - lx[None, :]
     dy = uy[:, None] - ly[None, :]
-    i_u, i_l = np.unravel_index((dx ** 2 + dy ** 2).argmin(), (len(ux), len(lx)))
+    i_u, i_l = np.unravel_index((dx**2 + dy**2).argmin(), (len(ux), len(lx)))
     return np.array([(ux[i_u] + lx[i_l]) / 2.0, (uy[i_u] + ly[i_l]) / 2.0], np.float32)
 
 
@@ -405,6 +408,7 @@ def build_landmarks(region_agg: dict) -> dict:
 
 
 # ── Fixed semipolar grid ─────────────────────────────────────────────────────
+
 
 def _project_arclen(poly, pt):
     """Arc-length position (0..S) of the roof-arc point closest to *pt*."""
@@ -460,7 +464,7 @@ def build_semipolar_grid(landmarks: dict, roof_arc: np.ndarray, n_gridlines: int
             v = O - p
             nv = np.linalg.norm(v)
             d = (v / nv) if nv > 1e-6 else np.array([0.0, 1.0], np.float32)
-            if d[1] < 0:      # ensure it points toward the floor (downward)
+            if d[1] < 0:  # ensure it points toward the floor (downward)
                 d = -d
         grid.append({"origin": p, "dir": d, "section": section})
 
@@ -471,7 +475,9 @@ def build_semipolar_grid(landmarks: dict, roof_arc: np.ndarray, n_gridlines: int
     nv = np.linalg.norm(v)
     grid[-1] = {
         "origin": pe.astype(np.float32),
-        "dir": (v / nv if nv > 1e-6 else np.array([-1.0, 0.0], np.float32)).astype(np.float32),
+        "dir": (v / nv if nv > 1e-6 else np.array([-1.0, 0.0], np.float32)).astype(
+            np.float32
+        ),
         "section": "pharyngeal",
         "floor_override": tb.astype(np.float32),
     }
@@ -479,6 +485,7 @@ def build_semipolar_grid(landmarks: dict, roof_arc: np.ndarray, n_gridlines: int
 
 
 # ── Ray / polyline intersection & VTD ────────────────────────────────────────
+
 
 def _ray_polyline_hit(origin, direction, poly, max_len=MAX_XY * 1.6):
     """Nearest intersection of the *line through origin along ±direction* with a
@@ -535,6 +542,7 @@ def compute_vtd(grid, roof_poly, floor_poly):
 
 # ── NPZ loading ──────────────────────────────────────────────────────────────
 
+
 def _load_regions(mask_path: Path):
     data = np.load(mask_path)
     keys = list(data.keys())
@@ -558,31 +566,33 @@ def _frame_regions(regions: dict, t: int):
 
 # matplotlib tab10-ish colors per region for the static figure
 _DIAG_COLORS = {
-    ROOF_FRONT_SUB: "#1f77b4",   # palate - blue
-    LOWER_LIP_SUB: "#ff7f0e",    # lower lip - orange
-    TONGUE_SUB: "#2ca02c",       # tongue - green
-    VELUM_SUB: "#d62728",        # velum - red
-    PHARYNX_SUB: "#9467bd",      # pharyngeal wall - purple
+    ROOF_FRONT_SUB: "#1f77b4",  # palate - blue
+    LOWER_LIP_SUB: "#ff7f0e",  # lower lip - orange
+    TONGUE_SUB: "#2ca02c",  # tongue - green
+    VELUM_SUB: "#d62728",  # velum - red
+    PHARYNX_SUB: "#9467bd",  # pharyngeal wall - purple
 }
 # BGR for the cv2 video
-_ROOF_BGR = (0, 0, 255)      # red
-_FLOOR_BGR = (255, 128, 0)   # blue
-_GRID_BGR = (255, 255, 0)    # cyan (Shi Fig 1b grid)
-_VTD_BGR = (0, 255, 255)     # yellow (Shi Fig 1b VTD segments)
+_ROOF_BGR = (0, 0, 255)  # red
+_FLOOR_BGR = (255, 128, 0)  # blue
+_GRID_BGR = (255, 255, 0)  # cyan (Shi Fig 1b grid)
+_VTD_BGR = (0, 255, 255)  # yellow (Shi Fig 1b VTD segments)
 
 
-def save_static_diagnostic(out_path, frame_regions, roof, floor, grid, U, Lp,
-                           landmarks):
+def save_static_diagnostic(
+    out_path, frame_regions, roof, floor, grid, U, Lp, landmarks
+):
     """One matplotlib figure: masks (translucent) + roof/floor edges + grid +
     VTD points, for a single representative frame."""
     import matplotlib
+
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.set_xlim(0, MAX_XY)
-    ax.set_ylim(MAX_XY, 0)     # image coords (y down)
+    ax.set_ylim(MAX_XY, 0)  # image coords (y down)
     ax.set_aspect("equal")
 
     for sub, m in frame_regions.items():
@@ -600,18 +610,31 @@ def save_static_diagnostic(out_path, frame_regions, roof, floor, grid, U, Lp,
         if np.isnan(u[0]) or np.isnan(l[0]):
             continue
         ax.plot([u[0], l[0]], [u[1], l[1]], color="cyan", lw=0.8, alpha=0.9, zorder=3)
-        ax.scatter([u[0], l[0]], [u[1], l[1]], s=10, color="yellow", zorder=5,
-                   linewidths=0)
+        ax.scatter(
+            [u[0], l[0]], [u[1], l[1]], s=10, color="yellow", zorder=5, linewidths=0
+        )
 
     if roof is not None:
         ax.plot(roof[:, 0], roof[:, 1], color="red", lw=2.0, zorder=4, label="roof")
     if floor is not None:
-        ax.plot(floor[:, 0], floor[:, 1], color="deepskyblue", lw=2.0, zorder=4,
-                label="floor")
+        ax.plot(
+            floor[:, 0],
+            floor[:, 1],
+            color="deepskyblue",
+            lw=2.0,
+            zorder=4,
+            label="floor",
+        )
     for name, p in landmarks.items():
         ax.scatter([p[0]], [p[1]], s=45, marker="+", color="white", zorder=6)
-        ax.annotate(name, (p[0], p[1]), fontsize=6, color="white",
-                    xytext=(2, -2), textcoords="offset points")
+        ax.annotate(
+            name,
+            (p[0], p[1]),
+            fontsize=6,
+            color="white",
+            xytext=(2, -2),
+            textcoords="offset points",
+        )
 
     ax.set_title(f"VTD grid ({len(grid)} lines)")
     ax.legend(loc="lower right", fontsize=8)
@@ -625,8 +648,17 @@ def _scale(x, y, mask_h, mask_w, fh, fw):
     return int(round(x * fw / mask_w)), int(round(y * fh / mask_h))
 
 
-def write_diagnostic_video(out_path, regions, T, video_path, grid,
-                           roof_frames, floor_frames, U_frames, L_frames):
+def write_diagnostic_video(
+    out_path,
+    regions,
+    T,
+    video_path,
+    grid,
+    roof_frames,
+    floor_frames,
+    U_frames,
+    L_frames,
+):
     """Per-frame overlay: masks (translucent), roof/floor edges, grid lines,
     VTD points."""
     mask_h = mask_w = MAX_XY
@@ -643,14 +675,17 @@ def write_diagnostic_video(out_path, regions, T, video_path, grid,
     else:
         cap = None
         fps = 50.0
-        fh, fw = mask_h * 5, mask_w * 5   # upscale blank canvas for legibility
+        fh, fw = mask_h * 5, mask_w * 5  # upscale blank canvas for legibility
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                             fps, (fw, fh))
+    writer = cv2.VideoWriter(
+        str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh)
+    )
     region_bgr = {
-        ROOF_FRONT_SUB: (180, 120, 30), LOWER_LIP_SUB: (30, 140, 240),
-        TONGUE_SUB: (40, 180, 40), VELUM_SUB: (40, 40, 200),
+        ROOF_FRONT_SUB: (180, 120, 30),
+        LOWER_LIP_SUB: (30, 140, 240),
+        TONGUE_SUB: (40, 180, 40),
+        VELUM_SUB: (40, 40, 200),
         PHARYNX_SUB: (180, 100, 150),
     }
 
@@ -666,8 +701,9 @@ def write_diagnostic_video(out_path, regions, T, video_path, grid,
         for sub, m in regions.items():
             if m is None or t >= m.shape[0] or not m[t].any():
                 continue
-            mr = cv2.resize(m[t].astype(np.uint8) * 255, (fw, fh),
-                            interpolation=cv2.INTER_NEAREST)
+            mr = cv2.resize(
+                m[t].astype(np.uint8) * 255, (fw, fh), interpolation=cv2.INTER_NEAREST
+            )
             colored = np.zeros_like(frame)
             colored[mr > 0] = region_bgr.get(sub, (128, 128, 128))
             cv2.addWeighted(colored, 0.4, overlay, 1.0, 0, overlay)
@@ -688,8 +724,9 @@ def write_diagnostic_video(out_path, regions, T, video_path, grid,
         for poly, col in ((roof, _ROOF_BGR), (floor, _FLOOR_BGR)):
             if poly is None or len(poly) < 2:
                 continue
-            pts = np.array([_scale(x, y, mask_h, mask_w, fh, fw) for x, y in poly],
-                           np.int32)
+            pts = np.array(
+                [_scale(x, y, mask_h, mask_w, fh, fw) for x, y in poly], np.int32
+            )
             cv2.polylines(frame, [pts], False, col, 2)
 
         writer.write(frame)
@@ -701,12 +738,15 @@ def write_diagnostic_video(out_path, regions, T, video_path, grid,
 
 # ── Per-speaker processing ───────────────────────────────────────────────────
 
+
 def _discover_speakers():
     if not SPK_BASE:
         return []
     return sorted(
-        d.name for d in DATA_DIR.iterdir()
-        if d.is_dir() and d.name.startswith(SPK_BASE)
+        d.name
+        for d in DATA_DIR.iterdir()
+        if d.is_dir()
+        and d.name.startswith(SPK_BASE)
         and (d / "sam_seg" / "masks").is_dir()
     )
 
@@ -754,26 +794,38 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     print(f"  Building fixed grid from {len(mask_files)} videos ...")
     grid, landmarks, region_agg, roof_arc = _build_speaker_grid(
-        mask_files, spk, n_gridlines)
+        mask_files, spk, n_gridlines
+    )
 
     for sub in ("pts", "norm", "hist", "raw", "grid", "diagnostic"):
         (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # persist the fixed grid + landmarks
     with open(out_dir / "grid" / f"{label}_grid.json", "w") as f:
-        json.dump({
-            "n_gridlines": n_gridlines,
-            "landmarks": {k: v.tolist() for k, v in landmarks.items()},
-            "grid": [{"origin": g["origin"].tolist(), "dir": g["dir"].tolist(),
-                      "section": g["section"]} for g in grid],
-        }, f, indent=2)
+        json.dump(
+            {
+                "n_gridlines": n_gridlines,
+                "landmarks": {k: v.tolist() for k, v in landmarks.items()},
+                "grid": [
+                    {
+                        "origin": g["origin"].tolist(),
+                        "dir": g["dir"].tolist(),
+                        "section": g["section"],
+                    }
+                    for g in grid
+                ],
+            },
+            f,
+            indent=2,
+        )
 
     # Pass 1: compute raw VTD (+ per-frame points) for every video
     from tqdm import tqdm
+
     per_video = {}
     all_vtd = []
     for mp in tqdm(mask_files, desc=f"  {label} VTD"):
-        basename = mp.stem[len(spk) + 1:] if spk is not None else mp.stem
+        basename = mp.stem[len(spk) + 1 :] if spk is not None else mp.stem
         regions, T = _load_regions(mp)
         if T == 0:
             continue
@@ -799,11 +851,19 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     # Per-speaker global min-max per grid line (Shi Eq. 3). Grid lines that
     # never intersect the airway (all-NaN columns) are normalized to 0/1 safely.
-    stacked = np.concatenate(all_vtd, axis=0)          # (sumT, L)
+    stacked = np.concatenate(all_vtd, axis=0)  # (sumT, L)
     all_nan = np.all(np.isnan(stacked), axis=0)
     with np.errstate(invalid="ignore"):
-        vmin = np.where(all_nan, 0.0, np.nanmin(np.where(np.isnan(stacked), np.inf, stacked), axis=0))
-        vmax = np.where(all_nan, 1.0, np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), axis=0))
+        vmin = np.where(
+            all_nan,
+            0.0,
+            np.nanmin(np.where(np.isnan(stacked), np.inf, stacked), axis=0),
+        )
+        vmax = np.where(
+            all_nan,
+            1.0,
+            np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), axis=0),
+        )
     rng = np.where((vmax - vmin) > 1e-6, vmax - vmin, 1.0)
 
     # Pass 2: write normalized VTD + histograms
@@ -827,36 +887,69 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     mp, regions, T, rf, ff, U_f, L_f = per_video[dbase]
     ti = T // 2
     save_static_diagnostic(
-        out_dir / "diagnostic" / f"{label}_grid_frame.png",
-        _frame_regions(regions, ti), rf[ti], ff[ti], grid, U_f[ti], L_f[ti],
-        landmarks)
+        out_dir / "diagnostic" / f"{label}_grid_frame.pdf",
+        _frame_regions(regions, ti),
+        rf[ti],
+        ff[ti],
+        grid,
+        U_f[ti],
+        L_f[ti],
+        landmarks,
+    )
 
     # Diagnostic videos for up to n_videos random videos
-    diag_bases = rng_r.sample(list(per_video.keys()),
-                              min(n_videos, len(per_video)))
+    diag_bases = rng_r.sample(list(per_video.keys()), min(n_videos, len(per_video)))
     for basename in tqdm(diag_bases, desc=f"  {label} diag videos"):
         mp, regions, T, rf, ff, U_f, L_f = per_video[basename]
         vpath = video_dir / f"{basename}.avi"
         write_diagnostic_video(
             out_dir / "diagnostic" / f"{basename}_vtd.mp4",
-            regions, T, vpath if vpath.exists() else None,
-            grid, rf, ff, U_f, L_f)
+            regions,
+            T,
+            vpath if vpath.exists() else None,
+            grid,
+            rf,
+            ff,
+            U_f,
+            L_f,
+        )
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     single = not SPK_BASE
-    p = argparse.ArgumentParser(description="Extract vocal-tract distance (VTD) from SAM2 masks.")
+    p = argparse.ArgumentParser(
+        description="Extract vocal-tract distance (VTD) from SAM2 masks."
+    )
     if not single:
-        p.add_argument("--spk", nargs="+", type=int, default=None, metavar="N",
-                       help=f"Speaker numbers (prefix '{SPK_BASE}'). Default: all.")
-    p.add_argument("--n-gridlines", type=int, default=N_GRIDLINES,
-                   help="TOTAL number of grid lines (default from config).")
-    p.add_argument("--n-videos", type=int, default=N_DIAGNOSTIC,
-                   help="Number of diagnostic videos per speaker.")
-    p.add_argument("--bins", type=int, default=N_BINS,
-                   help="Histogram bins per grid line (default from config).")
+        p.add_argument(
+            "--spk",
+            nargs="+",
+            type=int,
+            default=None,
+            metavar="N",
+            help=f"Speaker numbers (prefix '{SPK_BASE}'). Default: all.",
+        )
+    p.add_argument(
+        "--n-gridlines",
+        type=int,
+        default=N_GRIDLINES,
+        help="TOTAL number of grid lines (default from config).",
+    )
+    p.add_argument(
+        "--n-videos",
+        type=int,
+        default=N_DIAGNOSTIC,
+        help="Number of diagnostic videos per speaker.",
+    )
+    p.add_argument(
+        "--bins",
+        type=int,
+        default=N_BINS,
+        help="Histogram bins per grid line (default from config).",
+    )
     args = p.parse_args()
 
     if single:
