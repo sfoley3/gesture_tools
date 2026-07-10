@@ -4,27 +4,28 @@
 """
 extract_vtd.py — Vocal Tract Distance from SAM2 masks.
 
-Two boundary lines are traced per frame and VTD is the distance between them
-along L grid lines that connect corresponding (equal arc-length) points, so the
-grid follows the natural bend of the tract. No lingual origin, no semipolar /
-Proctor construction — just two lines:
+Two boundary lines are traced per frame and VTD is the closest distance between
+them. No lingual origin, no semipolar / Proctor construction — just two lines:
 
   ROOF  (upper wall), one continuous line, front -> back:
     bottom (airway-facing) edge of "upper lip - palate"   [lips -> hard palate]
-      -> straight bridge -> bottom edge of "velum"
-      -> straight bridge from the velum's bottom-right point to its CLOSEST
+      -> spliced to the bottom edge of "velum" WHERE THEY MEET (closest pair),
+         so the palate's posterior curl is dropped and no loop forms
+      -> straight bridge from the velum's bottom-right point to its closest
          point on the pharyngeal wall
-      -> pharyngeal-wall (airway-facing / left) edge from that junction DOWN to
-         the bottom (near where it meets the tongue). The wall is NOT traced
-         upward past the junction.
+      -> pharyngeal-wall (airway-facing / left) edge DOWN only as far as the
+         tongue reaches (constriction region; not to the wall's bottom).
 
   FLOOR (lower wall), one continuous line, front -> back:
-    top (airway-facing) edge of "lower lip - jaw"
-      -> straight bridge to the tongue's front (left-most) point
+    top (airway-facing) edge of "lower lip - jaw", spliced WHERE IT MEETS the
+    tongue (closest pair) so it never dips below the tongue,
       -> tongue upper surface (existing contour method) down to the tongue root.
 
-The posterior-most grid line therefore connects the tongue root/bottom to the
-pharyngeal wall, and the anterior-most connects the two lips (lip aperture).
+VTD: L points are spaced evenly along the tract MIDLINE (mean of the two walls),
+so the grid is evenly distributed throughout rather than bunching at corners. At
+each midline point the grid line runs to the nearest point on each wall and VTD
+is the distance between them. The anterior-most line is the lip aperture; the
+posterior-most connects the tongue root to the pharyngeal wall.
 
 Masks are anti-alias smoothed before tracing (upsample -> Gaussian blur ->
 threshold) so staircase pixelation does not inflate the distances.
@@ -33,8 +34,8 @@ Outputs (per speaker, under {data_dir}/[spk/]vtd/):
   pts/{basename}.npy    (T, L)      raw VTD in pixels
   norm/{basename}.npy   (T, L)      per-speaker min-max normalized (0=closed,1=open)
   hist/{basename}.npy   (L, bins)   per-gridline histogram of normalized VTD
-  lines/{basename}.npz  roof,floor  (T, L, 2) resampled wall points, for QA
-  diagnostic/{spk}_frame.png         one MRI frame + masks + lines + VTD points
+  lines/{basename}.npz  roof,floor  (T, L, 2) grid endpoint points, for QA
+  diagnostic/{spk}_frame.pdf         one MRI frame + masks + lines + VTD points
   diagnostic/{basename}_vtd.mp4      per-frame MRI overlay for --n-videos videos
 
 Speaker convention: face-left. Front of mouth = low x (left); back/pharynx =
@@ -60,6 +61,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, label
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 # ── Config (same pattern as the other gesture_tools scripts) ─────────────────
@@ -299,15 +301,25 @@ def _resample(line, n):
 # ── Wall line assembly (original-resolution coords) ──────────────────────────
 
 
+def _closest_pair(a, b):
+    """Indices (i, j) of the closest point between polylines a and b."""
+    tree = cKDTree(b)
+    d, idx = tree.query(a)
+    i = int(d.argmin())
+    return i, int(idx[i])
+
+
 def build_roof(reg_up: dict):
-    """One line: lips/palate bottom edge -> velum bottom edge -> pharyngeal
-    wall (from the velum-junction down). Returns (M,2) front->back in original
-    coords, or None."""
+    """One line, front -> back, in original coords:
+      palate bottom edge  ->(spliced where they meet)->  velum bottom edge
+      ->(bridge from velum bottom-right to closest wall point)->
+      pharyngeal-wall edge, DOWN only as far as the tongue reaches.
+    Returns (M,2) or None."""
     U = UPSCALE
     palate = reg_up.get(ROOF_FRONT_SUB)
     if palate is None:
         return None
-    pal = _bottom_edge(palate)
+    pal = _bottom_edge(palate)          # ascending x (lips -> hard palate)
     if len(pal) < 2:
         return None
     parts = [pal]
@@ -315,21 +327,29 @@ def build_roof(reg_up: dict):
 
     velum = reg_up.get(VELUM_SUB)
     if velum is not None:
-        vel = _bottom_edge(velum)
+        vel = _bottom_edge(velum)       # ascending x
         if len(vel) >= 2:
-            br = _bridge(tail, vel[0])
-            if len(br):
-                parts.append(br)
-            parts.append(vel)
-            tail = vel[-1]  # velum bottom-right
+            # Splice where the two bottom edges MEET (closest pair): keep the
+            # palate up to the junction, then the velum onward. This avoids the
+            # palate's posterior curl going up above the velum.
+            i, j = _closest_pair(pal, vel)
+            parts = [pal[:i + 1], vel[j:]]
+            tail = vel[-1]              # velum bottom-right
 
     wall = reg_up.get(PHARYNX_SUB)
+    tongue = reg_up.get(TONGUE_SUB)
     if wall is not None:
-        wl = _left_edge(wall)
+        wl = _left_edge(wall)           # ascending y (top -> bottom)
         if len(wl) >= 2:
-            # closest wall point to the velum bottom-right (or palate tail)
-            j = int(((wl - tail[None, :]) ** 2).sum(1).argmin())
-            seg = _trim_wall_bottom(wl[j:])  # from junction DOWN only
+            # Depth limit = the tongue's lowest extent (constriction region only;
+            # do NOT run to the bottom of the pharyngeal-wall mask).
+            if tongue is not None and tongue.any():
+                y_limit = float(np.where(tongue)[0].max())
+            else:
+                y_limit = float(wl[:, 1].max())
+            k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())   # velum junction
+            seg = wl[k:]
+            seg = seg[seg[:, 1] <= y_limit]
             if len(seg) >= 1:
                 br = _bridge(tail, seg[0])
                 if len(br):
@@ -341,23 +361,22 @@ def build_roof(reg_up: dict):
 
 
 def build_floor(reg_up: dict, jaw_ref_up):
-    """One line: lower-lip top edge -> tongue upper surface (tip -> root).
-    Returns (M,2) front->back in original coords, or None."""
+    """One line, front -> back, in original coords:
+      lower-lip top edge  ->(spliced where it meets the tongue)->  tongue upper
+      surface (contour method) down to the root. The lip is cut at the junction
+      so the floor never dips below the tongue contour. Returns (M,2) or None."""
     U = UPSCALE
     tongue = reg_up.get(TONGUE_SUB)
     upper = extract_upper_contour(tongue, jaw_ref_up) if tongue is not None else None
     if upper is None or len(upper) < 2:
         return None
-    parts = []
+    parts = [upper]
     lower = reg_up.get(LOWER_LIP_SUB)
     if lower is not None:
-        low = _top_edge(lower)
+        low = _top_edge(lower)          # ascending x (airway-facing top of lip)
         if len(low) >= 2:
-            parts.append(low)
-            br = _bridge(low[-1], upper[0])
-            if len(br):
-                parts.append(br)
-    parts.append(upper)
+            i, j = _closest_pair(low, upper)   # where lower lip meets the tongue
+            parts = [low[:i + 1], upper[j:]]
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
 
@@ -366,17 +385,31 @@ def build_floor(reg_up: dict, jaw_ref_up):
 
 
 def compute_vtd(roof, floor, n):
-    """Resample both walls to n corresponding (equal arc-length) points and
-    measure the distance between them. Returns (vtd (n,), roof_pts (n,2),
-    floor_pts (n,2)) or (nan, nan, nan) if either wall is missing."""
-    r = _resample(roof, n)
-    f = _resample(floor, n)
-    if r is None or f is None:
+    """VTD = wall-to-wall distance at n points spaced evenly along the tract.
+
+    Grid points are placed by equal arc length along the MIDLINE (the mean of
+    the two walls), so they are evenly distributed throughout the tract rather
+    than bunching near corners. At each midline point the grid line runs to the
+    nearest point on each wall; VTD is the distance between those two points.
+    Returns (vtd (n,), roof_pts (n,2), floor_pts (n,2)) or NaNs if a wall is
+    missing."""
+    if roof is None or floor is None or len(roof) < 2 or len(floor) < 2:
         nan1 = np.full(n, np.nan, np.float32)
         nan2 = np.full((n, 2), np.nan, np.float32)
         return nan1, nan2, nan2
-    vtd = np.linalg.norm(r - f, axis=1).astype(np.float32)
-    return vtd, r, f
+
+    M = max(n * 10, 400)
+    Rd = _resample(roof, M)
+    Fd = _resample(floor, M)
+    midline = 0.5 * (Rd + Fd)                 # arc-length-paired mean curve
+    mids = _resample(midline, n)              # n points, evenly spaced along tract
+
+    _, ir = cKDTree(Rd).query(mids)           # nearest roof point to each midpoint
+    _, iff = cKDTree(Fd).query(mids)          # nearest floor point
+    u = Rd[ir].astype(np.float32)
+    l = Fd[iff].astype(np.float32)
+    vtd = np.linalg.norm(u - l, axis=1).astype(np.float32)
+    return vtd, u, l
 
 
 # ── NPZ / frame helpers ──────────────────────────────────────────────────────
@@ -404,85 +437,26 @@ def _frame_walls(regions, t, jaw_ref):
 
 # ── Diagnostics (over the MRI frame) ─────────────────────────────────────────
 
-# BGR for cv2 video overlay
+# Region colors (match the SAM2 REGION_DEFS palette).
+_REGION_HEX = {
+    ROOF_FRONT_SUB: "#3cb44b",   # green   (upper lip - palate)
+    LOWER_LIP_SUB: "#e6194b",    # red     (lower lip - jaw)
+    TONGUE_SUB: "#4363d8",       # blue    (tongue)
+    VELUM_SUB: "#911eb4",        # purple  (velum)
+    PHARYNX_SUB: "#f58231",      # orange  (pharyngeal wall)
+}
+# Same colors as BGR for the cv2 video overlay.
 _REGION_BGR = {
-    ROOF_FRONT_SUB: (75, 180, 60),  # green   (upper lip - palate)
-    LOWER_LIP_SUB: (75, 25, 230),  # red     (lower lip - jaw)
-    TONGUE_SUB: (216, 99, 67),  # blue    (tongue)
-    VELUM_SUB: (180, 30, 145),  # purple  (velum)
-    PHARYNX_SUB: (49, 130, 245),  # orange  (pharyngeal wall)
+    ROOF_FRONT_SUB: (75, 180, 60),
+    LOWER_LIP_SUB: (75, 25, 230),
+    TONGUE_SUB: (216, 99, 67),
+    VELUM_SUB: (180, 30, 145),
+    PHARYNX_SUB: (49, 130, 245),
 }
 _ROOF_BGR = (0, 200, 0)  # green line
 _FLOOR_BGR = (0, 0, 255)  # red line
 _GRID_BGR = (255, 255, 0)  # cyan grid
 _VTD_BGR = (0, 255, 255)  # yellow VTD points
-
-
-def _read_frame(video_path, t, mask_hw):
-    """Return the MRI frame t (BGR) or a blank canvas sized to the mask."""
-    mh, mw = mask_hw
-    if video_path is not None and Path(video_path).exists():
-        cap = cv2.VideoCapture(str(video_path))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, t)
-        ok, frame = cap.read()
-        cap.release()
-        if ok:
-            return frame
-    return np.full((mh * 6, mw * 6, 3), 20, np.uint8)
-
-
-def _overlay(frame, regions, t, roof, floor, vtd_r, vtd_f):
-    fh, fw = frame.shape[:2]
-    mh = mw = None
-    for m in regions.values():
-        if m is not None:
-            mh, mw = m.shape[1], m.shape[2]
-            break
-    if mh is None:
-        return frame
-    sx, sy = fw / mw, fh / mh
-
-    for sub, m in regions.items():
-        if m is None or t >= m.shape[0] or not m[t].any():
-            continue
-        mr = cv2.resize(
-            m[t].astype(np.uint8) * 255, (fw, fh), interpolation=cv2.INTER_NEAREST
-        )
-        colored = np.zeros_like(frame)
-        colored[mr > 0] = _REGION_BGR.get(sub, (150, 150, 150))
-        cv2.addWeighted(colored, 0.35, frame, 1.0, 0, frame)
-
-    def _poly(line, color):
-        if line is None or len(line) < 2:
-            return
-        pts = np.array([[int(x * sx), int(y * sy)] for x, y in line], np.int32)
-        cv2.polylines(frame, [pts], False, color, 2)
-
-    _poly(roof, _ROOF_BGR)
-    _poly(floor, _FLOOR_BGR)
-    if vtd_r is not None and vtd_f is not None:
-        for u, l in zip(vtd_r, vtd_f):
-            if np.isnan(u[0]) or np.isnan(l[0]):
-                continue
-            p1 = (int(u[0] * sx), int(u[1] * sy))
-            p2 = (int(l[0] * sx), int(l[1] * sy))
-            cv2.line(frame, p1, p2, _GRID_BGR, 1)
-            cv2.circle(frame, p1, 3, _VTD_BGR, -1)
-            cv2.circle(frame, p2, 3, _VTD_BGR, -1)
-    return frame
-
-
-def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
-    frame = _read_frame(video_path, t, (regions_first_hw(regions)))
-    frame = _overlay(frame, regions, t, roof, floor, r, f)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    fh, fw = frame.shape[:2]
-    fig, ax = plt.subplots(figsize=(fw / 100, fh / 100))
-    ax.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    ax.axis("off")
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.savefig(str(out_path), bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
 
 
 def regions_first_hw(regions):
@@ -492,33 +466,119 @@ def regions_first_hw(regions):
     return 104, 104
 
 
-def write_diagnostic_video(out_path, regions, T, video_path, n_gridlines, jaw_ref):
+def _mri_frame(cap, t, mask_hw):
+    """Read frame t (or the current sequential frame) from an open VideoCapture,
+    resized to mask (H, W) grayscale. Returns (H, W) uint8 or None."""
+    mh, mw = mask_hw
+    if cap is None:
+        return None
+    ok, frame = cap.read()
+    if not ok:
+        return None
+    frame = cv2.resize(frame, (mw, mh), interpolation=cv2.INTER_LANCZOS4)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale):
+    """Draw masks (translucent), wall lines and VTD grid+points onto a BGR
+    canvas whose size is (mask * scale). Coordinates are in mask space."""
+    fh, fw = canvas.shape[:2]
+    for sub, m in regions.items():
+        if m is None or t >= m.shape[0] or not m[t].any():
+            continue
+        mr = cv2.resize(m[t].astype(np.uint8) * 255, (fw, fh),
+                        interpolation=cv2.INTER_NEAREST)
+        colored = np.zeros_like(canvas)
+        colored[mr > 0] = _REGION_BGR.get(sub, (150, 150, 150))
+        cv2.addWeighted(colored, 0.35, canvas, 1.0, 0, canvas)
+
+    def _poly(line, color):
+        if line is None or len(line) < 2:
+            return
+        pts = np.array([[int(x * scale), int(y * scale)] for x, y in line], np.int32)
+        cv2.polylines(canvas, [pts], False, color, 2)
+
+    if r is not None and f is not None:
+        for u, l in zip(r, f):
+            if np.isnan(u[0]) or np.isnan(l[0]):
+                continue
+            p1 = (int(u[0] * scale), int(u[1] * scale))
+            p2 = (int(l[0] * scale), int(l[1] * scale))
+            cv2.line(canvas, p1, p2, _GRID_BGR, 1)
+            cv2.circle(canvas, p1, 3, _VTD_BGR, -1)
+            cv2.circle(canvas, p2, 3, _VTD_BGR, -1)
+    _poly(roof, _ROOF_BGR)
+    _poly(floor, _FLOOR_BGR)
+    return canvas
+
+
+def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
+    """Vector PDF: MRI frame (resized to mask space) + translucent masks + wall
+    lines + VTD grid/points, all in mask coordinates."""
     mh, mw = regions_first_hw(regions)
+    mri = None
     if video_path is not None and Path(video_path).exists():
         cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 50.0
-        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or mw * 6
-        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or mh * 6
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or T
-    else:
-        cap = None
-        fps, fw, fh, n_frames = 50.0, mw * 6, mh * 6, T
+        cap.set(cv2.CAP_PROP_POS_FRAMES, t)
+        mri = _mri_frame(cap, t, (mh, mw))
+        cap.release()
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh)
-    )
-    for t in range(min(T, n_frames)):
-        if cap is not None:
-            ok, frame = cap.read()
-            if not ok:
-                break
+    fig, ax = plt.subplots(figsize=(6, 6))
+    if mri is not None:
+        ax.imshow(mri, cmap="gray", interpolation="nearest")
+    else:
+        ax.set_xlim(0, mw)
+        ax.set_ylim(mh, 0)
+    for sub, m in regions.items():
+        if m is None or t >= m.shape[0] or not m[t].any():
+            continue
+        import matplotlib.colors as mcolors
+        rgb = mcolors.to_rgb(_REGION_HEX.get(sub, "#888888"))
+        rgba = np.zeros((*m[t].shape, 4), np.float32)
+        rgba[..., :3] = rgb
+        rgba[..., 3] = m[t].astype(np.float32) * 0.35
+        ax.imshow(rgba, interpolation="nearest")
+    if r is not None and f is not None:
+        for u, l in zip(r, f):
+            if np.isnan(u[0]) or np.isnan(l[0]):
+                continue
+            ax.plot([u[0], l[0]], [u[1], l[1]], color="cyan", lw=0.6, zorder=3)
+            ax.scatter([u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5,
+                       linewidths=0)
+    if roof is not None:
+        ax.plot(roof[:, 0], roof[:, 1], color="lime", lw=1.8, zorder=4)
+    if floor is not None:
+        ax.plot(floor[:, 0], floor[:, 1], color="red", lw=1.8, zorder=4)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.savefig(str(out_path), bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+
+def write_diagnostic_video(out_path, regions, T, video_path, n_gridlines, jaw_ref,
+                           scale=6):
+    """Per-frame MRI overlay video (mask space, upscaled by `scale`)."""
+    mh, mw = regions_first_hw(regions)
+    fw, fh = mw * scale, mh * scale
+    cap = cv2.VideoCapture(str(video_path)) if (
+        video_path is not None and Path(video_path).exists()) else None
+    fps = (cap.get(cv2.CAP_PROP_FPS) or 50.0) if cap is not None else 50.0
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (fw, fh))
+    for t in range(T):
+        mri = _mri_frame(cap, t, (mh, mw)) if cap is not None else None
+        if mri is not None:
+            canvas = cv2.resize(cv2.cvtColor(mri, cv2.COLOR_GRAY2BGR), (fw, fh),
+                                interpolation=cv2.INTER_NEAREST)
         else:
-            frame = np.full((fh, fw, 3), 20, np.uint8)
+            canvas = np.full((fh, fw, 3), 20, np.uint8)
         roof, floor, _ = _frame_walls(regions, t, jaw_ref)
-        vtd, r, f = compute_vtd(roof, floor, n_gridlines)
-        _overlay(frame, regions, t, roof, floor, r, f)
-        writer.write(frame)
+        _, r, f = compute_vtd(roof, floor, n_gridlines)
+        _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale)
+        writer.write(canvas)
     if cap is not None:
         cap.release()
     writer.release()
