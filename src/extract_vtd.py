@@ -27,8 +27,10 @@ each midline point the grid line runs to the nearest point on each wall and VTD
 is the distance between them. The anterior-most line is the lip aperture; the
 posterior-most connects the tongue root to the pharyngeal wall.
 
-Masks are anti-alias smoothed before tracing (upsample -> Gaussian blur ->
-threshold) so staircase pixelation does not inflate the distances.
+De-staircasing: by default the two lines are traced on the raw 104-px masks and
+the derived polyline is Gaussian-smoothed (`sigma_path`) — fast and enough to
+remove pixelation. Optionally set `upscale > 1` to anti-alias the masks
+(upsample -> blur -> threshold) before tracing, at ~40x the cost.
 
 Outputs (per speaker, under {data_dir}/[spk/]vtd/):
   pts/{basename}.npy    (T, L)      raw VTD in pixels
@@ -73,9 +75,9 @@ _DEFAULT_CFG = {
     "dataset": "lss",
     "n_gridlines": 40,
     "n_bins": 20,
-    "upscale": 8,
+    "upscale": 1,       # 1 = fast (trace raw mask, smooth the line); >1 = anti-alias masks
     "pre_sigma": 1.5,
-    "sigma_path": 1.5,
+    "sigma_path": 2.0,  # Gaussian smoothing of the derived line (pixels)
 }
 
 
@@ -99,9 +101,9 @@ SPK_BASE = _cfg.get("spk_base", "")
 VIDEO_DIR = _cfg.get("video_dir", "video")
 N_GRIDLINES = int(_cfg.get("n_gridlines", 40))
 N_BINS = int(_cfg.get("n_bins", 20))
-UPSCALE = int(_cfg.get("upscale", 8))
+UPSCALE = int(_cfg.get("upscale", 1))
 PRE_SIGMA = float(_cfg.get("pre_sigma", 1.5))
-SIGMA_PATH = float(_cfg.get("sigma_path", 1.5))
+SIGMA_PATH = float(_cfg.get("sigma_path", 2.0))
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
 ROOF_FRONT_SUB = "upper lip"  # "upper lip - palate" (lips + hard palate)
@@ -132,19 +134,31 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
     return labeled == sizes.argmax()
 
 
-def smooth_mask(
-    mask2d: np.ndarray, upscale: int = UPSCALE, pre_sigma: float = PRE_SIGMA
-) -> np.ndarray:
-    """Anti-alias a binary mask: keep the largest component, upsample (cubic),
-    Gaussian-blur, threshold. Returns an (H*upscale, W*upscale) uint8 mask.
-    Tracing on this removes staircase pixelation so VTD isn't inflated."""
+def smooth_mask(mask2d: np.ndarray, upscale: int = None,
+                pre_sigma: float = None) -> np.ndarray:
+    """Return the largest connected component as a uint8 mask, optionally
+    anti-aliased by upsampling (cubic) + Gaussian blur + threshold.
+
+    Default (upscale<=1) is the FAST path: no upsampling — the derived line is
+    Gaussian-smoothed later by `_smooth_path`, which achieves the same de-
+    staircasing at a fraction of the cost (the 8x upsample + blur on every
+    region every frame is the script's main bottleneck). Set --upscale >1 only
+    if you want the extra sub-pixel boundary before tracing.
+
+    Reads the module globals when args are None so the --upscale CLI flag works
+    (avoids the default-argument binding trap)."""
     if mask2d is None or not mask2d.any():
         return None
-    core = _largest_component(mask2d).astype(np.float32)
+    up = UPSCALE if upscale is None else upscale
+    core = _largest_component(mask2d)
+    if up <= 1:
+        return core.astype(np.uint8)
+    ps = PRE_SIGMA if pre_sigma is None else pre_sigma
     H, W = core.shape
-    up = cv2.resize(core, (W * upscale, H * upscale), interpolation=cv2.INTER_CUBIC)
-    up = gaussian_filter(up, sigma=pre_sigma)
-    return (up > 0.5).astype(np.uint8)
+    big = cv2.resize(core.astype(np.float32), (W * up, H * up),
+                     interpolation=cv2.INTER_CUBIC)
+    big = gaussian_filter(big, sigma=ps)
+    return (big > 0.5).astype(np.uint8)
 
 
 # ── Edge tracing (operate on the upscaled smoothed mask) ─────────────────────

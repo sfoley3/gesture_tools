@@ -8,9 +8,9 @@
   "velum_processing": "pca",
   "smooth": true,
   "loess_span": 50,
-  "upscale": 8,
+  "upscale": 1,
   "pre_sigma": 1.5,
-  "sigma_path": 1.5,
+  "sigma_path": 2.0,
   "n_gridlines": 20,
   "n_bins": 20
 }
