@@ -75,7 +75,7 @@ _DEFAULT_CFG = {
     "dataset": "lss",
     "n_gridlines": 40,
     "n_bins": 20,
-    "upscale": 1,       # 1 = fast (trace raw mask, smooth the line); >1 = anti-alias masks
+    "upscale": 1,  # 1 = fast (trace raw mask, smooth the line); >1 = anti-alias masks
     "pre_sigma": 1.5,
     "sigma_path": 2.0,  # Gaussian smoothing of the derived line (pixels)
 }
@@ -134,8 +134,9 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
     return labeled == sizes.argmax()
 
 
-def smooth_mask(mask2d: np.ndarray, upscale: int = None,
-                pre_sigma: float = None) -> np.ndarray:
+def smooth_mask(
+    mask2d: np.ndarray, upscale: int = None, pre_sigma: float = None
+) -> np.ndarray:
     """Return the largest connected component as a uint8 mask, optionally
     anti-aliased by upsampling (cubic) + Gaussian blur + threshold.
 
@@ -155,8 +156,9 @@ def smooth_mask(mask2d: np.ndarray, upscale: int = None,
         return core.astype(np.uint8)
     ps = PRE_SIGMA if pre_sigma is None else pre_sigma
     H, W = core.shape
-    big = cv2.resize(core.astype(np.float32), (W * up, H * up),
-                     interpolation=cv2.INTER_CUBIC)
+    big = cv2.resize(
+        core.astype(np.float32), (W * up, H * up), interpolation=cv2.INTER_CUBIC
+    )
     big = gaussian_filter(big, sigma=ps)
     return (big > 0.5).astype(np.uint8)
 
