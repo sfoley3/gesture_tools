@@ -9,5 +9,8 @@
   "smooth": true,
   "loess_span": 50,
   "n_gridlines": 40,
-  "n_bins": 20
+  "n_bins": 20,
+  "upscale": 8,
+  "pre_sigma": 1.5,
+  "sigma_path": 1.5
 }
