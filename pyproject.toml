@@ -22,6 +22,7 @@ dependencies = [
 [project.scripts]
 extract-mask-kinematics = "extract_mask_kinematics:main"
 get-tongue-contours = "get_tongue_contours:main"
+extract-vtd = "extract_vtd:main"
 
 # The modules import each other as top-level names (e.g.
 # `from extract_mask_kinematics import extract_kinematics`), so they are
@@ -31,6 +32,7 @@ package-dir = { "" = "src" }
 py-modules = [
     "extract_mask_kinematics",
     "get_tongue_contours",
+    "extract_vtd",
     "plot_tongue",
     "ssanova",
     "get_tt_region",
