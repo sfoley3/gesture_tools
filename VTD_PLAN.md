@@ -40,13 +40,16 @@ Proctor 2010 spends most of its machinery on problems we **do not have**:
 | Centerline unknown | Dijkstra over graph of intensity minima (Eq. 1) | Centerline = medial line between segmented roof & floor |
 | Hard palate / teeth don't image | Manual palate reference, DFT head‑motion correction | `upper lip - palate` mask already contains the palate |
 | Rear pharyngeal wall faint | Average tissue boundary across frames as reference | Pharyngeal‑wall mask is provided |
+| Glottis/larynx reference | Segment the larynx | No larynx mask — posterior end is tongue‑bottom → closest pharyngeal‑wall point |
 | Tongue noise | DCT low‑pass smoothing | Optional LOESS reuse; masks are already clean |
 
 So grid construction becomes **fully deterministic from mask geometry** — no
 intensity profiles, no graph search, no manual anchors. The four Proctor
 landmarks and the lingual origin are all read straight off the masks:
 
-- **Glottis** → bottom of the `larynx` mask (and/or bottom of pharyngeal wall).
+- **Posterior end** → **bottom of the `tongue` mask** and its **closest point on
+  the `pharyngeal wall`**. There is **no larynx/glottis mask**; this pair defines
+  the posterior‑most grid line and the back end of the tract.
 - **Highest point on the palate** → min‑y pixel of `upper lip - palate`.
 - **Alveolar ridge** → existing `_find_alveolar_ridge()` (leftmost stable palate
   column from the time‑averaged mask).
@@ -111,10 +114,10 @@ Four contiguous sections, following the tract bend:
 3. **Mid‑oral / palatal fan** — equi‑spaced radial lines projected from the
    **lingual origin**, spanning from the alveolar ridge back through the mid
    pharynx. This is the fan that makes the grid hug the palatal bend.
-4. **Pharyngeal (posterior)** — parallel lines at regular intervals from the
-   **lingual‑origin level down to the glottis** (larynx). The posterior‑most
-   line is anchored at the **bottom of the tongue → pharyngeal‑wall** span (the
-   user's requested posterior end).
+4. **Pharyngeal (posterior)** — parallel (horizontal) lines at regular intervals
+   from the **lingual‑origin level down to the posterior end**. The posterior‑most
+   line is pinned to the **bottom of the tongue → closest pharyngeal‑wall point**
+   (the user's requested posterior end; no larynx/glottis is used).
 
 Each grid line is a directed segment from a point on the roof toward the floor.
 Grid‑line orientation is what makes VTD "tract‑normal" and gives the natural

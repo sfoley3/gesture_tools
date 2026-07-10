@@ -14,25 +14,29 @@ Unlike Proctor (who thresholds raw MRI intensity and runs Dijkstra to find the
 centerline), *every landmark is already segmented here*, so grid construction is
 fully deterministic from mask geometry:
 
-  * glottis           -> bottom of the ``larynx`` mask
   * palate apex       -> highest (min-y) point of the ``upper lip - palate`` mask
   * alveolar ridge    -> leftmost stable column of the time-averaged palate
   * lips              -> lip-aperture midpoint (upper-lip / lower-lip closest pair)
   * lingual origin    -> point equidistant from palate roof and rear pharyngeal
                          wall, near the time-averaged tongue centroid
+  * posterior end     -> bottom of the tongue mask and its closest point on the
+                         pharyngeal wall (there is NO larynx/glottis mask)
   * upper VT boundary -> palate + velum + pharyngeal-wall airway-facing edges
-  * lower VT boundary -> lower-lip inner edge + upper tongue surface
+  * lower VT boundary -> lower-lip inner edge + tongue airway-facing contour
+                         (tip over the top and down to the tongue bottom)
 
 VTD on grid line ``l`` = Euclidean pixel distance between that line's
-intersection with the upper (roof) boundary and the lower (floor) boundary.
+intersection with the upper (roof) boundary and the lower (floor) boundary. The
+posterior-most line is pinned to tongue-bottom -> closest pharyngeal-wall point.
 
 Grid layout (front -> back), following the natural tract bend:
   1. Labial     : vertical lines anterior to the alveolar ridge, through the lips
   2. Palatal fan: radial lines from the lingual origin across the oral bend
-  3. Pharyngeal : horizontal lines from the lingual-origin level down to glottis
+  3. Pharyngeal : horizontal lines from the lingual-origin level to the posterior
+                  end (tongue bottom / pharyngeal wall)
 
 ``--n-gridlines`` is the TOTAL number of grid lines, distributed evenly by arc
-length along the roof from the lip anchor to the pharyngeal anchor.
+length along the roof from the lip anchor to the pharyngeal (posterior) anchor.
 
 Usage:
     conda run -n myenv python extract_vtd.py [--spk 2 3 ...] \
@@ -85,12 +89,16 @@ N_BINS = int(_cfg.get("n_bins", 20))
 MAX_XY = 104
 
 # Region key substrings (case-insensitive). Pharyngeal wall auto-detects "pharyn".
+# There is no larynx/glottis mask; the posterior end of the tract is defined by
+# the bottom of the tongue and its closest point on the pharyngeal wall.
 ROOF_FRONT_SUB = "upper lip"   # "upper lip - palate"
 VELUM_SUB = "velum"
 PHARYNX_SUB = "pharyn"         # "pharyngeal wall"
 TONGUE_SUB = "tongue"
 LOWER_LIP_SUB = "lower lip"    # "lower lip - jaw"
-LARYNX_SUB = "larynx"
+
+# The five segmented regions, in canonical order.
+REGION_SUBS = [ROOF_FRONT_SUB, VELUM_SUB, PHARYNX_SUB, TONGUE_SUB, LOWER_LIP_SUB]
 
 
 # ── Mask-key helpers ─────────────────────────────────────────────────────────
@@ -174,7 +182,7 @@ def _anterior_arc_ordered(mask):
 
 def _top_arc_ordered(mask):
     """Top (low-y / airway-facing) arc of a mask, oriented front (low x) -> back
-    (high x). Used for the upper tongue surface and the lower-lip inner edge."""
+    (high x). Used for the lower-lip inner edge."""
     loops = _ordered_loops(mask)
     if not loops:
         return None
@@ -186,6 +194,40 @@ def _top_arc_ordered(mask):
     if len(arc) < 2:
         return None
     if arc[0, 0] > arc[-1, 0]:
+        arc = arc[::-1]
+    return arc
+
+
+def _arc_containing(loop, i, j, t):
+    """Cyclic arc i->j that passes through index t (from plot_pts_contour.py)."""
+    n = len(loop)
+    fwd_len = (j - i) % n
+    on_fwd = (t - i) % n <= fwd_len
+    fwd_idx = [(i + k) % n for k in range(fwd_len + 1)]
+    bwd_idx = [(i - k) % n for k in range(((i - j) % n) + 1)]
+    return loop[fwd_idx] if on_fwd else loop[bwd_idx]
+
+
+def _tongue_airway_arc(mask):
+    """Airway-facing tongue contour: from the tip (front / min-x) over the top
+    (min-y) and down the posterior edge to the tongue bottom (max-y). This is the
+    lower VT boundary through both the oral cavity and the pharynx. Oriented
+    front -> back/down."""
+    loops = _ordered_loops(mask)
+    if not loops:
+        return None
+    loop = max(loops, key=len)
+    L = int(np.argmin(loop[:, 0]))    # tip (front)
+    B = int(np.argmax(loop[:, 1]))    # bottom (posterior-inferior)
+    Tp = int(np.argmin(loop[:, 1]))   # airway-facing apex (top)
+    if Tp in (L, B):
+        fwd, bwd = _arc_between(loop, L, B)
+        arc = fwd if fwd[:, 1].mean() < bwd[:, 1].mean() else bwd
+    else:
+        arc = _arc_containing(loop, L, B, Tp)
+    if len(arc) < 2:
+        return None
+    if arc[0, 0] > arc[-1, 0]:         # front (low x) first
         arc = arc[::-1]
     return arc
 
@@ -225,7 +267,7 @@ def _join_front_back(front, back):
 
 
 def trace_roof(region_by_sub: dict):
-    """Upper VT boundary, front (lips) -> back (glottis):
+    """Upper VT boundary, front (lips) -> back/down (pharyngeal wall):
     palate bottom edge  ->  velum bottom edge  ->  pharyngeal-wall anterior edge."""
     palate = _bottom_arc_ordered(region_by_sub.get(ROOF_FRONT_SUB))
     velum = _bottom_arc_ordered(region_by_sub.get(VELUM_SUB))
@@ -241,10 +283,11 @@ def trace_roof(region_by_sub: dict):
 
 
 def trace_floor(region_by_sub: dict):
-    """Lower VT boundary, front (lips) -> back (root):
-    lower-lip inner (top) edge  ->  upper tongue surface."""
+    """Lower VT boundary, front (lips) -> back/down (tongue bottom):
+    lower-lip inner (top) edge  ->  tongue airway-facing contour (tip over the
+    top and down the posterior edge to the tongue bottom)."""
     lip = _top_arc_ordered(region_by_sub.get(LOWER_LIP_SUB))
-    tongue = _top_arc_ordered(region_by_sub.get(TONGUE_SUB))
+    tongue = _tongue_airway_arc(region_by_sub.get(TONGUE_SUB))
     floor = _join_front_back(lip, tongue)
     return _resample_polyline(floor)
 
@@ -276,13 +319,23 @@ def _palate_apex(palate_agg):
     return np.array([x_apex, float(y_top)], np.float32)
 
 
-def _glottis(larynx_agg, pharynx_agg):
-    src = larynx_agg if larynx_agg is not None else pharynx_agg
-    ys, xs = np.where(src)
-    y_bot = int(ys.max())
-    row = src[y_bot, :]
-    x = float(np.where(row)[0].mean())
-    return np.array([x, float(y_bot)], np.float32)
+def _posterior_anchor(tongue_agg, pharynx_agg):
+    """Posterior end of the tract: the bottom-most point of the tongue mask and
+    its closest point on the pharyngeal wall. The final grid line spans this
+    pair (this replaces any glottis/larynx reference — there is no larynx mask).
+    Returns (tongue_bottom (2,), pharyngeal_point (2,))."""
+    ty, tx = np.where(tongue_agg)
+    y_bot = int(ty.max())
+    x_bot = float(tx[ty == y_bot].mean())
+    tongue_bottom = np.array([x_bot, float(y_bot)], np.float32)
+    if pharynx_agg is not None and pharynx_agg.any():
+        qy, qx = np.where(pharynx_agg)
+        phar_pts = np.stack([qx, qy], 1).astype(np.float32)
+        d = ((phar_pts - tongue_bottom[None, :]) ** 2).sum(1)
+        phar_pt = phar_pts[d.argmin()].astype(np.float32)
+    else:
+        phar_pt = tongue_bottom.copy()
+    return tongue_bottom, phar_pt
 
 
 def _lips_point(palate_agg, lower_lip_agg):
@@ -338,13 +391,15 @@ def build_landmarks(region_agg: dict) -> dict:
     lower_lip = region_agg.get(LOWER_LIP_SUB)
     tongue = region_agg.get(TONGUE_SUB)
     pharynx = region_agg.get(PHARYNX_SUB)
-    larynx = region_agg.get(LARYNX_SUB)
+    tongue_bottom, pharyngeal_end = _posterior_anchor(tongue, pharynx)
     lm = {
         "alveolar_ridge": _alveolar_ridge(palate),
         "palate_apex": _palate_apex(palate),
-        "glottis": _glottis(larynx, pharynx),
         "lips": _lips_point(palate, lower_lip),
         "lingual_origin": _lingual_origin(palate, pharynx, tongue),
+        # posterior end: tongue bottom -> closest pharyngeal-wall point
+        "tongue_bottom": tongue_bottom,
+        "pharyngeal_end": pharyngeal_end,
     }
     return lm
 
@@ -364,21 +419,25 @@ def build_semipolar_grid(landmarks: dict, roof_arc: np.ndarray, n_gridlines: int
     unit direction pointing toward the floor, and a section label.
 
     n stations are placed evenly by arc length along the roof between the lip
-    anchor and the glottis. Direction per section:
+    anchor (anterior) and the pharyngeal end (posterior = the pharyngeal-wall
+    point closest to the tongue bottom). Direction per section:
       labial     -> straight down            (0, +1)
       palatal fan-> radial from lingual origin (origin - roof_pt)
       pharyngeal -> horizontal toward airway  (-1, 0)
     Section boundaries are the alveolar ridge (labial|fan) and the lingual-origin
-    height projected onto the roof (fan|pharyngeal)."""
+    height projected onto the roof (fan|pharyngeal).
+
+    The final grid line is pinned to the user-defined posterior measurement:
+    tongue_bottom -> pharyngeal_end (via a floor_override)."""
     O = landmarks["lingual_origin"]
     s_lips, cum = _project_arclen(roof_arc, landmarks["lips"])
     s_ar, _ = _project_arclen(roof_arc, landmarks["alveolar_ridge"])
-    s_glottis, _ = _project_arclen(roof_arc, landmarks["glottis"])
+    s_post, _ = _project_arclen(roof_arc, landmarks["pharyngeal_end"])
     # fan|pharyngeal boundary ~ arc position nearest the lingual-origin height
     phar_ref = np.array([O[0], O[1]], np.float32)
     s_ph, _ = _project_arclen(roof_arc, phar_ref)
 
-    s0, s1 = min(s_lips, s_glottis), max(s_lips, s_glottis)
+    s0, s1 = min(s_lips, s_post), max(s_lips, s_post)
     s_ar = float(np.clip(s_ar, s0, s1))
     s_ph = float(np.clip(s_ph, s0, s1))
     lo, hi = sorted([s_ar, s_ph])
@@ -404,6 +463,18 @@ def build_semipolar_grid(landmarks: dict, roof_arc: np.ndarray, n_gridlines: int
             if d[1] < 0:      # ensure it points toward the floor (downward)
                 d = -d
         grid.append({"origin": p, "dir": d, "section": section})
+
+    # Pin the posterior-most line to tongue_bottom -> pharyngeal_end exactly.
+    tb = landmarks["tongue_bottom"]
+    pe = landmarks["pharyngeal_end"]
+    v = tb - pe
+    nv = np.linalg.norm(v)
+    grid[-1] = {
+        "origin": pe.astype(np.float32),
+        "dir": (v / nv if nv > 1e-6 else np.array([-1.0, 0.0], np.float32)).astype(np.float32),
+        "section": "pharyngeal",
+        "floor_override": tb.astype(np.float32),
+    }
     return grid
 
 
@@ -449,7 +520,11 @@ def compute_vtd(grid, roof_poly, floor_poly):
         u_pt, _ = _ray_polyline_hit(o, d, roof_poly)
         if u_pt is None:
             u_pt = o
-        l_pt, _ = _ray_polyline_hit(u_pt, d, floor_poly)
+        # posterior-most line is pinned to tongue_bottom via floor_override
+        if "floor_override" in gl:
+            l_pt = gl["floor_override"]
+        else:
+            l_pt, _ = _ray_polyline_hit(u_pt, d, floor_poly)
         if l_pt is None:
             continue
         U[i] = u_pt
@@ -463,7 +538,7 @@ def compute_vtd(grid, roof_poly, floor_poly):
 def _load_regions(mask_path: Path):
     data = np.load(mask_path)
     keys = list(data.keys())
-    subs = [ROOF_FRONT_SUB, VELUM_SUB, PHARYNX_SUB, TONGUE_SUB, LOWER_LIP_SUB, LARYNX_SUB]
+    subs = REGION_SUBS
     regions = {}
     for sub in subs:
         k = _find_mask_key(keys, sub)
@@ -488,7 +563,6 @@ _DIAG_COLORS = {
     TONGUE_SUB: "#2ca02c",       # tongue - green
     VELUM_SUB: "#d62728",        # velum - red
     PHARYNX_SUB: "#9467bd",      # pharyngeal wall - purple
-    LARYNX_SUB: "#8c564b",       # larynx - brown
 }
 # BGR for the cv2 video
 _ROOF_BGR = (0, 0, 255)      # red
@@ -577,7 +651,7 @@ def write_diagnostic_video(out_path, regions, T, video_path, grid,
     region_bgr = {
         ROOF_FRONT_SUB: (180, 120, 30), LOWER_LIP_SUB: (30, 140, 240),
         TONGUE_SUB: (40, 180, 40), VELUM_SUB: (40, 40, 200),
-        PHARYNX_SUB: (180, 100, 150), LARYNX_SUB: (90, 90, 140),
+        PHARYNX_SUB: (180, 100, 150),
     }
 
     for t in range(T):
@@ -640,7 +714,7 @@ def _discover_speakers():
 def _build_speaker_grid(mask_files, spk, n_gridlines):
     """Aggregate occupancy across all of the speaker's videos, derive landmarks,
     and build the fixed semipolar grid + aggregate roof arc."""
-    subs = [ROOF_FRONT_SUB, VELUM_SUB, PHARYNX_SUB, TONGUE_SUB, LOWER_LIP_SUB, LARYNX_SUB]
+    subs = REGION_SUBS
     acc = {s: None for s in subs}
     cnt = {s: 0 for s in subs}
     for mp in mask_files:
