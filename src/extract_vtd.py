@@ -319,7 +319,7 @@ def build_roof(reg_up: dict):
     palate = reg_up.get(ROOF_FRONT_SUB)
     if palate is None:
         return None
-    pal = _bottom_edge(palate)          # ascending x (lips -> hard palate)
+    pal = _bottom_edge(palate)  # ascending x (lips -> hard palate)
     if len(pal) < 2:
         return None
     parts = [pal]
@@ -327,19 +327,19 @@ def build_roof(reg_up: dict):
 
     velum = reg_up.get(VELUM_SUB)
     if velum is not None:
-        vel = _bottom_edge(velum)       # ascending x
+        vel = _bottom_edge(velum)  # ascending x
         if len(vel) >= 2:
             # Splice where the two bottom edges MEET (closest pair): keep the
             # palate up to the junction, then the velum onward. This avoids the
             # palate's posterior curl going up above the velum.
             i, j = _closest_pair(pal, vel)
-            parts = [pal[:i + 1], vel[j:]]
-            tail = vel[-1]              # velum bottom-right
+            parts = [pal[: i + 1], vel[j:]]
+            tail = vel[-1]  # velum bottom-right
 
     wall = reg_up.get(PHARYNX_SUB)
     tongue = reg_up.get(TONGUE_SUB)
     if wall is not None:
-        wl = _left_edge(wall)           # ascending y (top -> bottom)
+        wl = _left_edge(wall)  # ascending y (top -> bottom)
         if len(wl) >= 2:
             # Depth limit = the tongue's lowest extent (constriction region only;
             # do NOT run to the bottom of the pharyngeal-wall mask).
@@ -347,7 +347,7 @@ def build_roof(reg_up: dict):
                 y_limit = float(np.where(tongue)[0].max())
             else:
                 y_limit = float(wl[:, 1].max())
-            k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())   # velum junction
+            k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())  # velum junction
             seg = wl[k:]
             seg = seg[seg[:, 1] <= y_limit]
             if len(seg) >= 1:
@@ -362,9 +362,9 @@ def build_roof(reg_up: dict):
 
 def build_floor(reg_up: dict, jaw_ref_up):
     """One line, front -> back, in original coords:
-      lower-lip top edge  ->(spliced where it meets the tongue)->  tongue upper
-      surface (contour method) down to the root. The lip is cut at the junction
-      so the floor never dips below the tongue contour. Returns (M,2) or None."""
+    lower-lip top edge  ->(spliced where it meets the tongue)->  tongue upper
+    surface (contour method) down to the root. The lip is cut at the junction
+    so the floor never dips below the tongue contour. Returns (M,2) or None."""
     U = UPSCALE
     tongue = reg_up.get(TONGUE_SUB)
     upper = extract_upper_contour(tongue, jaw_ref_up) if tongue is not None else None
@@ -373,10 +373,10 @@ def build_floor(reg_up: dict, jaw_ref_up):
     parts = [upper]
     lower = reg_up.get(LOWER_LIP_SUB)
     if lower is not None:
-        low = _top_edge(lower)          # ascending x (airway-facing top of lip)
+        low = _top_edge(lower)  # ascending x (airway-facing top of lip)
         if len(low) >= 2:
-            i, j = _closest_pair(low, upper)   # where lower lip meets the tongue
-            parts = [low[:i + 1], upper[j:]]
+            i, j = _closest_pair(low, upper)  # where lower lip meets the tongue
+            parts = [low[: i + 1], upper[j:]]
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
 
@@ -401,11 +401,11 @@ def compute_vtd(roof, floor, n):
     M = max(n * 10, 400)
     Rd = _resample(roof, M)
     Fd = _resample(floor, M)
-    midline = 0.5 * (Rd + Fd)                 # arc-length-paired mean curve
-    mids = _resample(midline, n)              # n points, evenly spaced along tract
+    midline = 0.5 * (Rd + Fd)  # arc-length-paired mean curve
+    mids = _resample(midline, n)  # n points, evenly spaced along tract
 
-    _, ir = cKDTree(Rd).query(mids)           # nearest roof point to each midpoint
-    _, iff = cKDTree(Fd).query(mids)          # nearest floor point
+    _, ir = cKDTree(Rd).query(mids)  # nearest roof point to each midpoint
+    _, iff = cKDTree(Fd).query(mids)  # nearest floor point
     u = Rd[ir].astype(np.float32)
     l = Fd[iff].astype(np.float32)
     vtd = np.linalg.norm(u - l, axis=1).astype(np.float32)
@@ -439,11 +439,11 @@ def _frame_walls(regions, t, jaw_ref):
 
 # Region colors (match the SAM2 REGION_DEFS palette).
 _REGION_HEX = {
-    ROOF_FRONT_SUB: "#3cb44b",   # green   (upper lip - palate)
-    LOWER_LIP_SUB: "#e6194b",    # red     (lower lip - jaw)
-    TONGUE_SUB: "#4363d8",       # blue    (tongue)
-    VELUM_SUB: "#911eb4",        # purple  (velum)
-    PHARYNX_SUB: "#f58231",      # orange  (pharyngeal wall)
+    ROOF_FRONT_SUB: "#3cb44b",  # green   (upper lip - palate)
+    LOWER_LIP_SUB: "#e6194b",  # red     (lower lip - jaw)
+    TONGUE_SUB: "#4363d8",  # blue    (tongue)
+    VELUM_SUB: "#911eb4",  # purple  (velum)
+    PHARYNX_SUB: "#f58231",  # orange  (pharyngeal wall)
 }
 # Same colors as BGR for the cv2 video overlay.
 _REGION_BGR = {
@@ -486,8 +486,9 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale):
     for sub, m in regions.items():
         if m is None or t >= m.shape[0] or not m[t].any():
             continue
-        mr = cv2.resize(m[t].astype(np.uint8) * 255, (fw, fh),
-                        interpolation=cv2.INTER_NEAREST)
+        mr = cv2.resize(
+            m[t].astype(np.uint8) * 255, (fw, fh), interpolation=cv2.INTER_NEAREST
+        )
         colored = np.zeros_like(canvas)
         colored[mr > 0] = _REGION_BGR.get(sub, (150, 150, 150))
         cv2.addWeighted(colored, 0.35, canvas, 1.0, 0, canvas)
@@ -534,6 +535,7 @@ def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
         if m is None or t >= m.shape[0] or not m[t].any():
             continue
         import matplotlib.colors as mcolors
+
         rgb = mcolors.to_rgb(_REGION_HEX.get(sub, "#888888"))
         rgba = np.zeros((*m[t].shape, 4), np.float32)
         rgba[..., :3] = rgb
@@ -544,8 +546,9 @@ def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
             if np.isnan(u[0]) or np.isnan(l[0]):
                 continue
             ax.plot([u[0], l[0]], [u[1], l[1]], color="cyan", lw=0.6, zorder=3)
-            ax.scatter([u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5,
-                       linewidths=0)
+            ax.scatter(
+                [u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5, linewidths=0
+            )
     if roof is not None:
         ax.plot(roof[:, 0], roof[:, 1], color="lime", lw=1.8, zorder=4)
     if floor is not None:
@@ -556,23 +559,31 @@ def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
     plt.close(fig)
 
 
-def write_diagnostic_video(out_path, regions, T, video_path, n_gridlines, jaw_ref,
-                           scale=6):
+def write_diagnostic_video(
+    out_path, regions, T, video_path, n_gridlines, jaw_ref, scale=6
+):
     """Per-frame MRI overlay video (mask space, upscaled by `scale`)."""
     mh, mw = regions_first_hw(regions)
     fw, fh = mw * scale, mh * scale
-    cap = cv2.VideoCapture(str(video_path)) if (
-        video_path is not None and Path(video_path).exists()) else None
+    cap = (
+        cv2.VideoCapture(str(video_path))
+        if (video_path is not None and Path(video_path).exists())
+        else None
+    )
     fps = (cap.get(cv2.CAP_PROP_FPS) or 50.0) if cap is not None else 50.0
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                             fps, (fw, fh))
+    writer = cv2.VideoWriter(
+        str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh)
+    )
     for t in range(T):
         mri = _mri_frame(cap, t, (mh, mw)) if cap is not None else None
         if mri is not None:
-            canvas = cv2.resize(cv2.cvtColor(mri, cv2.COLOR_GRAY2BGR), (fw, fh),
-                                interpolation=cv2.INTER_NEAREST)
+            canvas = cv2.resize(
+                cv2.cvtColor(mri, cv2.COLOR_GRAY2BGR),
+                (fw, fh),
+                interpolation=cv2.INTER_NEAREST,
+            )
         else:
             canvas = np.full((fh, fw, 3), 20, np.uint8)
         roof, floor, _ = _frame_walls(regions, t, jaw_ref)
@@ -609,7 +620,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     pattern = f"{spk}_*.npz" if spk is not None else "*.npz"
     mask_files = sorted(mask_dir.glob(pattern))
-    mask_files = mask_files[:10]
+    # mask_files = mask_files[:2]
     if not mask_files:
         print(f"  No mask files in {mask_dir}")
         return
@@ -619,7 +630,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     per_video = {}  # basename -> (mask_path, video_path, T)
     all_vtd = []
     for mp in tqdm(mask_files, desc=f"  {label} VTD"):
-        basename = mp.stem[len(spk) + 1 :] if spk is not None else mp.stem
+        basename = mp.stem
         regions, T = _load_regions(mp)
         if T == 0:
             continue
@@ -638,6 +649,8 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
         np.savez(out_dir / "lines" / f"{basename}.npz", roof=roof_pts, floor=floor_pts)
         vpath = video_dir / f"{basename}.avi"
+        if not vpath.exists():
+            print(f"  Warning: video not found for {basename}: {vpath}")
         per_video[basename] = (mp, vpath if vpath.exists() else None, T)
         all_vtd.append(vtd)
 

@@ -2,7 +2,7 @@
   "data_dir":    "/data1/span_data/prompt/data/mri",
   "n_diagnostic": 5,
   "spk_base": "spk",
-  "video_dir": "video",
+  "video_dir": "video_split",
   "textgrid_dir": "",
   "audio_dir": "audio",
   "velum_processing": "pca",
@@ -11,6 +11,6 @@
   "upscale": 8,
   "pre_sigma": 1.5,
   "sigma_path": 1.5,
-  "n_gridlines": 12,
+  "n_gridlines": 20,
   "n_bins": 20
 }
