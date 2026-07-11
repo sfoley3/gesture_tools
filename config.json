@@ -11,6 +11,7 @@
   "upscale": 1,
   "pre_sigma": 1.5,
   "sigma_path": 2.0,
+  "even_total": false,
   "n_gridlines": 20,
   "n_bins": 20
 }

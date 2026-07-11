@@ -21,11 +21,17 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
     tongue (closest pair) so it never dips below the tongue,
       -> tongue upper surface (existing contour method) down to the tongue root.
 
-VTD: L points are spaced evenly along the tract MIDLINE (mean of the two walls),
-so the grid is evenly distributed throughout rather than bunching at corners. At
-each midline point the grid line runs to the nearest point on each wall and VTD
-is the distance between them. The anterior-most line is the lip aperture; the
-posterior-most connects the tongue root to the pharyngeal wall.
+VTD grid: a smoothed midline (mean of the two walls) is split by THREE anchors —
+the lips, the center of the velum's lower edge, and the tongue back — into an
+oral cavity (lips->velum) and a pharyngeal cavity (velum->tongue back). Each
+cavity is filled with the same number of lines, so grid index l has a consistent
+anatomical meaning regardless of cavity length (this controls for VT-length
+differences). Each grid line runs PERPENDICULAR to the local midline tangent (so
+its angle follows the tract curvature, a polar fan) and is intersected with both
+walls; VTD is the straight-line distance between the two crossings. The 3 anchors
+are included as regular lines. Total lines L = 2n+3 (odd, default: n=5 -> 13) or
+2n+2 (even, --parity even), where n = --n-gridlines is the interior lines per
+cavity (n each side of the velum anchor).
 
 De-staircasing: by default the two lines are traced on the raw 104-px masks and
 the derived polyline is Gaussian-smoothed (`sigma_path`) — fast and enough to
@@ -45,8 +51,11 @@ high x (right); roof = low y (top); floor = high y (bottom).
 
 Usage:
     conda run -n myenv python extract_vtd.py [--spk 2 3 ...] \
-        [--n-gridlines 40] [--n-videos 5] [--bins 20] \
-        [--upscale 8] [--pre-sigma 1.5] [--sigma-path 1.5]
+        [--n-gridlines 10] [--parity even|odd] [--n-videos 5] [--bins 20] \
+        [--upscale 1] [--pre-sigma 1.5] [--sigma-path 2.0]
+
+grid_meta.json (written per speaker) records n_per_cavity, even_total, the total
+line count, and the anchor indices [lips, velum, tongue_back].
 """
 
 import argparse
@@ -78,6 +87,7 @@ _DEFAULT_CFG = {
     "upscale": 1,       # 1 = fast (trace raw mask, smooth the line); >1 = anti-alias masks
     "pre_sigma": 1.5,
     "sigma_path": 2.0,  # Gaussian smoothing of the derived line (pixels)
+    "even_total": False,  # False -> 2n+3 grid lines (odd, default: n=5 -> 13); True -> 2n+2
 }
 
 
@@ -104,6 +114,8 @@ N_BINS = int(_cfg.get("n_bins", 20))
 UPSCALE = int(_cfg.get("upscale", 1))
 PRE_SIGMA = float(_cfg.get("pre_sigma", 1.5))
 SIGMA_PATH = float(_cfg.get("sigma_path", 2.0))
+EVEN_TOTAL = bool(_cfg.get("even_total", False))
+MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
 ROOF_FRONT_SUB = "upper lip"  # "upper lip - palate" (lips + hard palate)
@@ -398,32 +410,133 @@ def build_floor(reg_up: dict, jaw_ref_up):
 # ── VTD ──────────────────────────────────────────────────────────────────────
 
 
-def compute_vtd(roof, floor, n):
-    """VTD = wall-to-wall distance at n points spaced evenly along the tract.
+def _edge_center(edge):
+    """Arc-length midpoint of an (M,2) polyline (e.g. the velum's lower edge)."""
+    if edge is None or len(edge) == 0:
+        return None
+    if len(edge) == 1:
+        return edge[0].astype(np.float32)
+    seg = np.sqrt((np.diff(edge, axis=0) ** 2).sum(1))
+    cum = np.concatenate([[0], np.cumsum(seg)])
+    total = cum[-1]
+    if total <= 0:
+        return edge[len(edge) // 2].astype(np.float32)
+    s = total / 2.0
+    return np.array([np.interp(s, cum, edge[:, 0]),
+                     np.interp(s, cum, edge[:, 1])], np.float32)
 
-    Grid points are placed by equal arc length along the MIDLINE (the mean of
-    the two walls), so they are evenly distributed throughout the tract rather
-    than bunching near corners. At each midline point the grid line runs to the
-    nearest point on each wall; VTD is the distance between those two points.
-    Returns (vtd (n,), roof_pts (n,2), floor_pts (n,2)) or NaNs if a wall is
-    missing."""
+
+def _ray_polyline_hit(origin, direction, poly, max_len=None):
+    """Nearest intersection of the infinite line through `origin` along
+    ±`direction` with a polyline. Returns the (x,y) point or None."""
+    if poly is None or len(poly) < 2:
+        return None
+    if max_len is None:
+        max_len = MAX_XY * 2.0
+    o = origin.astype(np.float64)
+    d = direction.astype(np.float64)
+    a = poly[:-1].astype(np.float64)
+    b = poly[1:].astype(np.float64)
+    seg = b - a
+    denom = d[0] * (-seg[:, 1]) - d[1] * (-seg[:, 0])
+    rhs = a - o
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (rhs[:, 0] * (-seg[:, 1]) - rhs[:, 1] * (-seg[:, 0])) / denom
+        u = (d[0] * rhs[:, 1] - d[1] * rhs[:, 0]) / denom
+    ok = np.isfinite(t) & np.isfinite(u) & (u >= 0) & (u <= 1) & (np.abs(t) <= max_len)
+    if not ok.any():
+        return None
+    ti = t[ok]
+    return (o + ti[np.argmin(np.abs(ti))] * d).astype(np.float32)
+
+
+def _total_lines(n, even_total):
+    """Total grid-line count: 2n+2 (even) or 2n+3 (odd)."""
+    return 2 * n + 2 if even_total else 2 * n + 3
+
+
+def anchor_indices(n, even_total):
+    """Indices of the 3 anchor lines (lips, velum, tongue-back) in the grid."""
+    return [0, n + 1, (2 * n + 1) if even_total else (2 * n + 2)]
+
+
+def _grid_positions(s_a, s_b, s_c, n, even_total):
+    """Midline arc-length positions of all grid lines, anterior -> posterior.
+
+    Oral cavity spans [s_a, s_b], pharyngeal [s_b, s_c]; each is filled with the
+    same number of lines so grid index is anatomically consistent regardless of
+    cavity length. even_total shares the velum anchor as the pharyngeal start
+    (2n+2 lines); odd keeps it as a separate interior split (2n+3)."""
+    if even_total:
+        oral = np.linspace(s_a, s_b, n + 1, endpoint=False)   # s_a + n interior
+        phar = np.linspace(s_b, s_c, n + 1, endpoint=True)    # s_b .. s_c
+        return np.concatenate([oral, phar])
+    oral_int = np.linspace(s_a, s_b, n + 2)[1:-1]
+    phar_int = np.linspace(s_b, s_c, n + 2)[1:-1]
+    return np.concatenate([[s_a], oral_int, [s_b], phar_int, [s_c]])
+
+
+def compute_vtd(roof, floor, velum_center, n, even_total=True):
+    """VTD along straight cross-tract lines at grid points anchored to the lips,
+    the velum (lower-edge center), and the tongue back.
+
+    A smoothed midline (mean of the two walls) is split into an oral cavity
+    (lips -> velum) and a pharyngeal cavity (velum -> tongue back); each gets the
+    same number of lines. At each grid point the line runs PERPENDICULAR to the
+    local midline tangent (so its angle follows the tract curvature) and is
+    intersected with each wall; VTD is the distance between the two crossings.
+
+    Returns (vtd (L,), roof_pts (L,2), floor_pts (L,2), anchor_idx) with
+    L = 2n+2 (even) or 2n+3 (odd). Missing intersections fall back to the
+    nearest wall point so no line is dropped."""
+    L = _total_lines(n, even_total)
+    a_idx = anchor_indices(n, even_total)
+    nanL = np.full(L, np.nan, np.float32)
+    nanL2 = np.full((L, 2), np.nan, np.float32)
     if roof is None or floor is None or len(roof) < 2 or len(floor) < 2:
-        nan1 = np.full(n, np.nan, np.float32)
-        nan2 = np.full((n, 2), np.nan, np.float32)
-        return nan1, nan2, nan2
+        return nanL, nanL2.copy(), nanL2.copy(), a_idx
 
-    M = max(n * 10, 400)
+    M = max(L * 20, 600)
     Rd = _resample(roof, M)
     Fd = _resample(floor, M)
-    midline = 0.5 * (Rd + Fd)  # arc-length-paired mean curve
-    mids = _resample(midline, n)  # n points, evenly spaced along tract
+    midline = _smooth_path(0.5 * (Rd + Fd), max(SIGMA_PATH, 1.0))
+    seg = np.sqrt((np.diff(midline, axis=0) ** 2).sum(1))
+    cum = np.concatenate([[0], np.cumsum(seg)])
+    total = cum[-1]
+    if total <= 0:
+        return nanL, nanL2.copy(), nanL2.copy(), a_idx
+    tang = np.gradient(midline, axis=0)
 
-    _, ir = cKDTree(Rd).query(mids)  # nearest roof point to each midpoint
-    _, iff = cKDTree(Fd).query(mids)  # nearest floor point
-    u = Rd[ir].astype(np.float32)
-    l = Fd[iff].astype(np.float32)
-    vtd = np.linalg.norm(u - l, axis=1).astype(np.float32)
-    return vtd, u, l
+    # Velum anchor arc length (fallback: tract midpoint)
+    if velum_center is not None:
+        vc = np.asarray(velum_center, np.float32)
+        s_b = float(cum[int(((midline - vc[None, :]) ** 2).sum(1).argmin())])
+    else:
+        s_b = 0.5 * total
+    s_b = min(max(s_b, 1e-3), total - 1e-3)
+
+    positions = _grid_positions(0.0, s_b, total, n, even_total)
+    u_pts = np.full((L, 2), np.nan, np.float32)
+    l_pts = np.full((L, 2), np.nan, np.float32)
+    vtd = np.full(L, np.nan, np.float32)
+    for i, s in enumerate(positions):
+        p = np.array([np.interp(s, cum, midline[:, 0]),
+                      np.interp(s, cum, midline[:, 1])], np.float32)
+        tx = np.interp(s, cum, tang[:, 0])
+        ty = np.interp(s, cum, tang[:, 1])
+        tn = np.hypot(tx, ty)
+        normal = np.array([-ty, tx], np.float64) / tn if tn > 1e-9 \
+            else np.array([0.0, 1.0])
+        u = _ray_polyline_hit(p, normal, Rd)
+        l = _ray_polyline_hit(p, normal, Fd)
+        if u is None:
+            u = Rd[int(((Rd - p[None, :]) ** 2).sum(1).argmin())]
+        if l is None:
+            l = Fd[int(((Fd - p[None, :]) ** 2).sum(1).argmin())]
+        u_pts[i] = u
+        l_pts[i] = l
+        vtd[i] = float(np.linalg.norm(u - l))
+    return vtd, u_pts, l_pts, a_idx
 
 
 # ── NPZ / frame helpers ──────────────────────────────────────────────────────
@@ -440,13 +553,25 @@ def _load_regions(mask_path: Path):
     return regions, T
 
 
+def _velum_lower_center(reg_up):
+    """Center of the velum's lower (airway-facing) edge, in original coords."""
+    vel = reg_up.get(VELUM_SUB)
+    if vel is None or not vel.any():
+        return None
+    edge = _bottom_edge(vel)
+    c = _edge_center(edge)
+    return None if c is None else (c / UPSCALE)
+
+
 def _frame_walls(regions, t, jaw_ref):
-    """Smooth-upscale each region at frame t, then trace roof & floor."""
+    """Smooth-upscale each region at frame t, then trace roof & floor and locate
+    the velum lower-edge center. Returns (roof, floor, velum_center, reg_up)."""
     reg_up = {}
     for sub, m in regions.items():
         reg_up[sub] = smooth_mask(m[t]) if (m is not None and t < m.shape[0]) else None
     jaw_up = (jaw_ref[0] * UPSCALE, jaw_ref[1] * UPSCALE) if jaw_ref else None
-    return build_roof(reg_up), build_floor(reg_up, jaw_up), reg_up
+    return (build_roof(reg_up), build_floor(reg_up, jaw_up),
+            _velum_lower_center(reg_up), reg_up)
 
 
 # ── Diagnostics (over the MRI frame) ─────────────────────────────────────────
@@ -469,7 +594,8 @@ _REGION_BGR = {
 }
 _ROOF_BGR = (0, 200, 0)  # green line
 _FLOOR_BGR = (0, 0, 255)  # red line
-_GRID_BGR = (255, 255, 0)  # cyan grid
+_GRID_BGR = (255, 255, 0)  # cyan grid (interior lines)
+_ANCHOR_BGR = (255, 0, 255)  # magenta grid (anchor lines: lips, velum, tongue-back)
 _VTD_BGR = (0, 255, 255)  # yellow VTD points
 
 
@@ -493,9 +619,10 @@ def _mri_frame(cap, t, mask_hw):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
-def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale):
+def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=()):
     """Draw masks (translucent), wall lines and VTD grid+points onto a BGR
-    canvas whose size is (mask * scale). Coordinates are in mask space."""
+    canvas whose size is (mask * scale). Coordinates are in mask space. Anchor
+    grid lines (indices in `anchor_idx`) are drawn magenta and thicker."""
     fh, fw = canvas.shape[:2]
     for sub, m in regions.items():
         if m is None or t >= m.shape[0] or not m[t].any():
@@ -513,13 +640,16 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale):
         pts = np.array([[int(x * scale), int(y * scale)] for x, y in line], np.int32)
         cv2.polylines(canvas, [pts], False, color, 2)
 
+    anchor_set = set(anchor_idx)
     if r is not None and f is not None:
-        for u, l in zip(r, f):
+        for i, (u, l) in enumerate(zip(r, f)):
             if np.isnan(u[0]) or np.isnan(l[0]):
                 continue
             p1 = (int(u[0] * scale), int(u[1] * scale))
             p2 = (int(l[0] * scale), int(l[1] * scale))
-            cv2.line(canvas, p1, p2, _GRID_BGR, 1)
+            is_anchor = i in anchor_set
+            cv2.line(canvas, p1, p2, _ANCHOR_BGR if is_anchor else _GRID_BGR,
+                     2 if is_anchor else 1)
             cv2.circle(canvas, p1, 3, _VTD_BGR, -1)
             cv2.circle(canvas, p2, 3, _VTD_BGR, -1)
     _poly(roof, _ROOF_BGR)
@@ -527,9 +657,11 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale):
     return canvas
 
 
-def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
+def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f,
+                           anchor_idx=()):
     """Vector PDF: MRI frame (resized to mask space) + translucent masks + wall
-    lines + VTD grid/points, all in mask coordinates."""
+    lines + VTD grid/points, all in mask coordinates. Anchor grid lines are
+    drawn magenta; interior lines cyan."""
     mh, mw = regions_first_hw(regions)
     mri = None
     if video_path is not None and Path(video_path).exists():
@@ -555,11 +687,15 @@ def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f):
         rgba[..., :3] = rgb
         rgba[..., 3] = m[t].astype(np.float32) * 0.35
         ax.imshow(rgba, interpolation="nearest")
+    anchor_set = set(anchor_idx)
     if r is not None and f is not None:
-        for u, l in zip(r, f):
+        for i, (u, l) in enumerate(zip(r, f)):
             if np.isnan(u[0]) or np.isnan(l[0]):
                 continue
-            ax.plot([u[0], l[0]], [u[1], l[1]], color="cyan", lw=0.6, zorder=3)
+            is_anchor = i in anchor_set
+            ax.plot([u[0], l[0]], [u[1], l[1]],
+                    color="magenta" if is_anchor else "cyan",
+                    lw=1.4 if is_anchor else 0.6, zorder=3)
             ax.scatter(
                 [u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5, linewidths=0
             )
@@ -600,9 +736,9 @@ def write_diagnostic_video(
             )
         else:
             canvas = np.full((fh, fw, 3), 20, np.uint8)
-        roof, floor, _ = _frame_walls(regions, t, jaw_ref)
-        _, r, f = compute_vtd(roof, floor, n_gridlines)
-        _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale)
+        roof, floor, vel_c, _ = _frame_walls(regions, t, jaw_ref)
+        _, r, f, a_idx = compute_vtd(roof, floor, vel_c, n_gridlines, EVEN_TOTAL)
+        _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
         cap.release()
@@ -641,6 +777,17 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     for sub in ("pts", "norm", "hist", "lines", "diagnostic"):
         (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
+    L = _total_lines(n_gridlines, EVEN_TOTAL)
+    a_idx = anchor_indices(n_gridlines, EVEN_TOTAL)
+    with open(out_dir / "grid_meta.json", "w") as fh:
+        json.dump({
+            "n_per_cavity": n_gridlines,
+            "even_total": EVEN_TOTAL,
+            "total_lines": L,
+            "anchor_indices": a_idx,
+            "anchor_names": ["lips", "velum", "tongue_back"],
+        }, fh, indent=2)
+
     per_video = {}  # basename -> (mask_path, video_path, T)
     all_vtd = []
     for mp in tqdm(mask_files, desc=f"  {label} VTD"):
@@ -653,12 +800,12 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
             if regions[TONGUE_SUB] is not None and regions[LOWER_LIP_SUB] is not None
             else None
         )
-        vtd = np.full((T, n_gridlines), np.nan, np.float32)
-        roof_pts = np.full((T, n_gridlines, 2), np.nan, np.float32)
-        floor_pts = np.full((T, n_gridlines, 2), np.nan, np.float32)
+        vtd = np.full((T, L), np.nan, np.float32)
+        roof_pts = np.full((T, L, 2), np.nan, np.float32)
+        floor_pts = np.full((T, L, 2), np.nan, np.float32)
         for t in range(T):
-            roof, floor, _ = _frame_walls(regions, t, jaw_ref)
-            v, r, f = compute_vtd(roof, floor, n_gridlines)
+            roof, floor, vel_c, _ = _frame_walls(regions, t, jaw_ref)
+            v, r, f, _ = compute_vtd(roof, floor, vel_c, n_gridlines, EVEN_TOTAL)
             vtd[t], roof_pts[t], floor_pts[t] = v, r, f
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
         np.savez(out_dir / "lines" / f"{basename}.npz", roof=roof_pts, floor=floor_pts)
@@ -687,8 +834,8 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         vtd = np.load(out_dir / "pts" / f"{basename}.npy")
         norm = np.clip((vtd - vmin[None, :]) / rng[None, :], 0.0, 1.0)
         np.save(out_dir / "norm" / f"{basename}.npy", norm.astype(np.float32))
-        hist = np.zeros((n_gridlines, n_bins), np.float32)
-        for l in range(n_gridlines):
+        hist = np.zeros((L, n_bins), np.float32)
+        for l in range(L):
             col = norm[:, l][np.isfinite(norm[:, l])]
             if col.size:
                 hist[l], _ = np.histogram(col, bins=n_bins, range=(0.0, 1.0))
@@ -706,8 +853,8 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         else None
     )
     ti = T // 2
-    roof, floor, _ = _frame_walls(regions, ti, jaw_ref)
-    _, r, f = compute_vtd(roof, floor, n_gridlines)
+    roof, floor, vel_c, _ = _frame_walls(regions, ti, jaw_ref)
+    _, r, f, a_idx = compute_vtd(roof, floor, vel_c, n_gridlines, EVEN_TOTAL)
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
@@ -717,6 +864,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         floor,
         r,
         f,
+        a_idx,
     )
 
     for basename in tqdm(
@@ -743,7 +891,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
 
 def main():
-    global UPSCALE, PRE_SIGMA, SIGMA_PATH
+    global UPSCALE, PRE_SIGMA, SIGMA_PATH, EVEN_TOTAL
     single = not SPK_BASE
     p = argparse.ArgumentParser(
         description="Extract vocal-tract distance (VTD) from SAM2 masks."
@@ -757,14 +905,19 @@ def main():
             metavar="N",
             help=f"Speaker numbers (prefix '{SPK_BASE}'). Default: all.",
         )
-    p.add_argument("--n-gridlines", type=int, default=N_GRIDLINES)
+    p.add_argument("--n-gridlines", type=int, default=N_GRIDLINES,
+                   help="Interior lines per cavity (n). Total = 2n+2 (even) or 2n+3 (odd).")
     p.add_argument("--n-videos", type=int, default=N_DIAGNOSTIC)
     p.add_argument("--bins", type=int, default=N_BINS)
     p.add_argument("--upscale", type=int, default=UPSCALE)
     p.add_argument("--pre-sigma", type=float, default=PRE_SIGMA)
     p.add_argument("--sigma-path", type=float, default=SIGMA_PATH)
+    p.add_argument("--parity", choices=["even", "odd"],
+                   default="even" if EVEN_TOTAL else "odd",
+                   help="even -> 2n+2 grid lines; odd -> 2n+3.")
     args = p.parse_args()
     UPSCALE, PRE_SIGMA, SIGMA_PATH = args.upscale, args.pre_sigma, args.sigma_path
+    EVEN_TOTAL = (args.parity == "even")
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")
