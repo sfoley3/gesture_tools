@@ -17,9 +17,12 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
          tongue reaches (constriction region; not to the wall's bottom).
 
   FLOOR (lower wall), one continuous line, front -> back:
-    top (airway-facing) edge of "lower lip - jaw", spliced WHERE IT MEETS the
-    tongue (closest pair) so it never dips below the tongue,
-      -> tongue upper surface (existing contour method) down to the tongue root.
+    top (airway-facing) edge of "lower lip - jaw" — front-cavity overhang removal
+    drops any lip point that has a floor point above it and not to its right
+    (up-and-left OR directly above), i.e. under the tongue, below the lip
+    aperture, or a vertical overhang, so the front floor is monotone and its
+    connectors don't cross -> tongue airway-facing contour (dorsum from the jaw
+    junction to the root, then down the posterior/backside edge to the bottom).
 
 VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
 the tongue back — split each wall into an oral cavity (lips->velum) and a
@@ -442,11 +445,19 @@ def build_floor(reg_up: dict, jaw_ref_up):
     if lower is not None:
         low = _top_edge(lower)  # ascending x (airway-facing top of lip)
         if len(low) >= 1:
-            # drop lip points that lie under the tongue (tongue above at same x)
-            _, idx = cKDTree(upper[:, :1]).query(low[:, :1])
-            under = (np.abs(low[:, 0] - upper[idx, 0]) < 1.5 * U) & \
-                    (low[:, 1] > upper[idx, 1] + 0.5 * U)
-            low = low[~under]
+            # Front-cavity overhang removal: drop a lip point if ANY floor point
+            # (lip or tongue) is above it and NOT to its right — i.e. up-and-left
+            # OR directly above (same column). This removes points under the
+            # tongue, anterior dips below the lip aperture, and vertical
+            # overhangs, leaving a monotone front floor whose connectors don't
+            # cross. Scoped to the lip, so the tongue dorsum and the descending
+            # backside (pharyngeal cavity) are left intact.
+            ref = np.vstack([low, upper])
+            rx = ref[:, 0][None, :]
+            ry = ref[:, 1][None, :]
+            drop = ((rx <= low[:, 0:1] + 0.5 * U) &
+                    (ry < low[:, 1:2] - 0.5 * U)).any(axis=1)
+            low = low[~drop]
             if len(low) >= 1:
                 parts = [low, upper]
     line = np.concatenate(parts, axis=0) / U
