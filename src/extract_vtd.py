@@ -21,17 +21,17 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
     tongue (closest pair) so it never dips below the tongue,
       -> tongue upper surface (existing contour method) down to the tongue root.
 
-VTD grid: a smoothed midline (mean of the two walls) is split by THREE anchors —
-the lips, the center of the velum's lower edge, and the tongue back — into an
-oral cavity (lips->velum) and a pharyngeal cavity (velum->tongue back). Each
-cavity is filled with the same number of lines, so grid index l has a consistent
-anatomical meaning regardless of cavity length (this controls for VT-length
-differences). Each grid line runs PERPENDICULAR to the local midline tangent (so
-its angle follows the tract curvature, a polar fan) and is intersected with both
-walls; VTD is the straight-line distance between the two crossings. The 3 anchors
-are included as regular lines. Total lines L = 2n+3 (odd, default: n=5 -> 13) or
-2n+2 (even, --parity even), where n = --n-gridlines is the interior lines per
-cavity (n each side of the velum anchor).
+VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
+the tongue back — split each wall into an oral cavity (lips->velum) and a
+pharyngeal cavity (velum->tongue back); the velum split on the floor is the point
+CLOSEST to the velum center. Within each cavity both walls are arc-length
+resampled to the same number of points and connected index-to-index, so each
+line joins a point to its counterpart on the opposite wall. Connectors are
+monotonic, so they never cross each other and never cut across the tongue
+surface, and each cavity is filled with the same number of lines regardless of
+its length (this controls for VT-length differences). VTD is the length of each
+connector. Total lines L = 2n+3 (odd, default: n=5 -> 13) or 2n+2 (even,
+--parity even), where n = --n-gridlines is the interior lines per cavity.
 
 De-staircasing: by default the two lines are traced on the raw 104-px masks and
 the derived polyline is Gaussian-smoothed (`sigma_path`) — fast and enough to
@@ -428,32 +428,8 @@ def _edge_center(edge):
                      np.interp(s, cum, edge[:, 1])], np.float32)
 
 
-def _ray_polyline_hit(origin, direction, poly, max_len=None):
-    """Nearest intersection of the infinite line through `origin` along
-    ±`direction` with a polyline. Returns the (x,y) point or None."""
-    if poly is None or len(poly) < 2:
-        return None
-    if max_len is None:
-        max_len = MAX_XY * 2.0
-    o = origin.astype(np.float64)
-    d = direction.astype(np.float64)
-    a = poly[:-1].astype(np.float64)
-    b = poly[1:].astype(np.float64)
-    seg = b - a
-    denom = d[0] * (-seg[:, 1]) - d[1] * (-seg[:, 0])
-    rhs = a - o
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t = (rhs[:, 0] * (-seg[:, 1]) - rhs[:, 1] * (-seg[:, 0])) / denom
-        u = (d[0] * rhs[:, 1] - d[1] * rhs[:, 0]) / denom
-    ok = np.isfinite(t) & np.isfinite(u) & (u >= 0) & (u <= 1) & (np.abs(t) <= max_len)
-    if not ok.any():
-        return None
-    ti = t[ok]
-    return (o + ti[np.argmin(np.abs(ti))] * d).astype(np.float32)
-
-
 def _total_lines(n, even_total):
-    """Total grid-line count: 2n+2 (even) or 2n+3 (odd)."""
+    """Total grid-line count: 2n+3 (odd, default) or 2n+2 (even)."""
     return 2 * n + 2 if even_total else 2 * n + 3
 
 
@@ -462,83 +438,56 @@ def anchor_indices(n, even_total):
     return [0, n + 1, (2 * n + 1) if even_total else (2 * n + 2)]
 
 
-def _grid_positions(s_a, s_b, s_c, n, even_total):
-    """Midline arc-length positions of all grid lines, anterior -> posterior.
-
-    Oral cavity spans [s_a, s_b], pharyngeal [s_b, s_c]; each is filled with the
-    same number of lines so grid index is anatomically consistent regardless of
-    cavity length. even_total shares the velum anchor as the pharyngeal start
-    (2n+2 lines); odd keeps it as a separate interior split (2n+3)."""
-    if even_total:
-        oral = np.linspace(s_a, s_b, n + 1, endpoint=False)   # s_a + n interior
-        phar = np.linspace(s_b, s_c, n + 1, endpoint=True)    # s_b .. s_c
-        return np.concatenate([oral, phar])
-    oral_int = np.linspace(s_a, s_b, n + 2)[1:-1]
-    phar_int = np.linspace(s_b, s_c, n + 2)[1:-1]
-    return np.concatenate([[s_a], oral_int, [s_b], phar_int, [s_c]])
+def _split_index(poly, point):
+    """Index on `poly` of the point closest to `point`, kept off the ends."""
+    i = int(((poly - np.asarray(point, np.float32)[None, :]) ** 2).sum(1).argmin())
+    return min(max(i, 1), len(poly) - 2)
 
 
-def compute_vtd(roof, floor, velum_center, n, even_total=True):
-    """VTD along straight cross-tract lines at grid points anchored to the lips,
-    the velum (lower-edge center), and the tongue back.
+def compute_vtd(roof, floor, velum_center, n, even_total=False):
+    """VTD by connecting CORRESPONDING points on the two walls.
 
-    A smoothed midline (mean of the two walls) is split into an oral cavity
-    (lips -> velum) and a pharyngeal cavity (velum -> tongue back); each gets the
-    same number of lines. At each grid point the line runs PERPENDICULAR to the
-    local midline tangent (so its angle follows the tract curvature) and is
-    intersected with each wall; VTD is the distance between the two crossings.
+    Each wall is split into an oral cavity (lips -> velum) and a pharyngeal
+    cavity (velum -> tongue back). The split is the velum-lower-edge center on
+    the roof and its CLOSEST counterpart on the floor. Within each cavity both
+    walls are arc-length resampled to the same number of points and connected
+    index-to-index, so:
+      * every line joins a point to its counterpart on the opposite wall,
+      * the same number of lines fill each cavity regardless of its length,
+      * connectors are monotonic -> they never cross each other and never cut
+        across the tongue surface (the failure mode of a straight normal ray).
+    VTD is the length of each connector.
 
-    Returns (vtd (L,), roof_pts (L,2), floor_pts (L,2), anchor_idx) with
-    L = 2n+2 (even) or 2n+3 (odd). Missing intersections fall back to the
-    nearest wall point so no line is dropped."""
+    Returns (vtd (L,), roof_pts (L,2), floor_pts (L,2), anchor_idx), with
+    L = 2n+3 (odd) or 2n+2 (even). The velum anchor is the shared cavity
+    boundary, counted once."""
     L = _total_lines(n, even_total)
     a_idx = anchor_indices(n, even_total)
     nanL = np.full(L, np.nan, np.float32)
     nanL2 = np.full((L, 2), np.nan, np.float32)
-    if roof is None or floor is None or len(roof) < 2 or len(floor) < 2:
+    if roof is None or floor is None or len(roof) < 3 or len(floor) < 3:
         return nanL, nanL2.copy(), nanL2.copy(), a_idx
 
-    M = max(L * 20, 600)
-    Rd = _resample(roof, M)
-    Fd = _resample(floor, M)
-    midline = _smooth_path(0.5 * (Rd + Fd), max(SIGMA_PATH, 1.0))
-    seg = np.sqrt((np.diff(midline, axis=0) ** 2).sum(1))
-    cum = np.concatenate([[0], np.cumsum(seg)])
-    total = cum[-1]
-    if total <= 0:
-        return nanL, nanL2.copy(), nanL2.copy(), a_idx
-    tang = np.gradient(midline, axis=0)
+    # Velum split: center on the roof, closest counterpart on the floor.
+    i_bu = _split_index(roof, velum_center) if velum_center is not None \
+        else len(roof) // 2
+    i_bl = _split_index(floor, roof[i_bu])
 
-    # Velum anchor arc length (fallback: tract midpoint)
-    if velum_center is not None:
-        vc = np.asarray(velum_center, np.float32)
-        s_b = float(cum[int(((midline - vc[None, :]) ** 2).sum(1).argmin())])
-    else:
-        s_b = 0.5 * total
-    s_b = min(max(s_b, 1e-3), total - 1e-3)
+    # Points per cavity, sharing the velum anchor (counted once):
+    #   odd  -> oral n+2, phar n+2  => 2n+3
+    #   even -> oral n+2, phar n+1  => 2n+2
+    k_o = n + 2
+    k_p = (n + 1) if even_total else (n + 2)
 
-    positions = _grid_positions(0.0, s_b, total, n, even_total)
-    u_pts = np.full((L, 2), np.nan, np.float32)
-    l_pts = np.full((L, 2), np.nan, np.float32)
-    vtd = np.full(L, np.nan, np.float32)
-    for i, s in enumerate(positions):
-        p = np.array([np.interp(s, cum, midline[:, 0]),
-                      np.interp(s, cum, midline[:, 1])], np.float32)
-        tx = np.interp(s, cum, tang[:, 0])
-        ty = np.interp(s, cum, tang[:, 1])
-        tn = np.hypot(tx, ty)
-        normal = np.array([-ty, tx], np.float64) / tn if tn > 1e-9 \
-            else np.array([0.0, 1.0])
-        u = _ray_polyline_hit(p, normal, Rd)
-        l = _ray_polyline_hit(p, normal, Fd)
-        if u is None:
-            u = Rd[int(((Rd - p[None, :]) ** 2).sum(1).argmin())]
-        if l is None:
-            l = Fd[int(((Fd - p[None, :]) ** 2).sum(1).argmin())]
-        u_pts[i] = u
-        l_pts[i] = l
-        vtd[i] = float(np.linalg.norm(u - l))
-    return vtd, u_pts, l_pts, a_idx
+    ru_o = _resample(roof[: i_bu + 1], k_o)
+    fl_o = _resample(floor[: i_bl + 1], k_o)
+    ru_p = _resample(roof[i_bu:], k_p)
+    fl_p = _resample(floor[i_bl:], k_p)
+
+    u = np.concatenate([ru_o, ru_p[1:]], axis=0).astype(np.float32)   # drop dup velum
+    l = np.concatenate([fl_o, fl_p[1:]], axis=0).astype(np.float32)
+    vtd = np.linalg.norm(u - l, axis=1).astype(np.float32)
+    return vtd, u, l, a_idx
 
 
 # ── NPZ / frame helpers ──────────────────────────────────────────────────────
