@@ -1,8 +1,8 @@
 {
-  "data_dir":    "/data1/span_data/prompt/data/mri",
+  "data_dir":    "/data1/span_data/usc_lss",
   "n_diagnostic": 5,
-  "spk_base": "spk",
-  "video_dir": "video_split",
+  "spk_base": "",
+  "video_dir": "video",
   "textgrid_dir": "",
   "audio_dir": "audio",
   "velum_processing": "pca",
@@ -12,6 +12,6 @@
   "pre_sigma": 1.5,
   "sigma_path": 2.0,
   "even_total": false,
-  "n_gridlines": 20,
+  "n_gridlines": 10,
   "n_bins": 20
 }

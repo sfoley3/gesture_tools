@@ -424,8 +424,9 @@ def _edge_center(edge):
     if total <= 0:
         return edge[len(edge) // 2].astype(np.float32)
     s = total / 2.0
-    return np.array([np.interp(s, cum, edge[:, 0]),
-                     np.interp(s, cum, edge[:, 1])], np.float32)
+    return np.array(
+        [np.interp(s, cum, edge[:, 0]), np.interp(s, cum, edge[:, 1])], np.float32
+    )
 
 
 def _total_lines(n, even_total):
@@ -469,8 +470,9 @@ def compute_vtd(roof, floor, velum_center, n, even_total=False):
         return nanL, nanL2.copy(), nanL2.copy(), a_idx
 
     # Velum split: center on the roof, closest counterpart on the floor.
-    i_bu = _split_index(roof, velum_center) if velum_center is not None \
-        else len(roof) // 2
+    i_bu = (
+        _split_index(roof, velum_center) if velum_center is not None else len(roof) // 2
+    )
     i_bl = _split_index(floor, roof[i_bu])
 
     # Points per cavity, sharing the velum anchor (counted once):
@@ -484,7 +486,7 @@ def compute_vtd(roof, floor, velum_center, n, even_total=False):
     ru_p = _resample(roof[i_bu:], k_p)
     fl_p = _resample(floor[i_bl:], k_p)
 
-    u = np.concatenate([ru_o, ru_p[1:]], axis=0).astype(np.float32)   # drop dup velum
+    u = np.concatenate([ru_o, ru_p[1:]], axis=0).astype(np.float32)  # drop dup velum
     l = np.concatenate([fl_o, fl_p[1:]], axis=0).astype(np.float32)
     vtd = np.linalg.norm(u - l, axis=1).astype(np.float32)
     return vtd, u, l, a_idx
@@ -521,8 +523,12 @@ def _frame_walls(regions, t, jaw_ref):
     for sub, m in regions.items():
         reg_up[sub] = smooth_mask(m[t]) if (m is not None and t < m.shape[0]) else None
     jaw_up = (jaw_ref[0] * UPSCALE, jaw_ref[1] * UPSCALE) if jaw_ref else None
-    return (build_roof(reg_up), build_floor(reg_up, jaw_up),
-            _velum_lower_center(reg_up), reg_up)
+    return (
+        build_roof(reg_up),
+        build_floor(reg_up, jaw_up),
+        _velum_lower_center(reg_up),
+        reg_up,
+    )
 
 
 # ── Diagnostics (over the MRI frame) ─────────────────────────────────────────
@@ -599,8 +605,13 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=(
             p1 = (int(u[0] * scale), int(u[1] * scale))
             p2 = (int(l[0] * scale), int(l[1] * scale))
             is_anchor = i in anchor_set
-            cv2.line(canvas, p1, p2, _ANCHOR_BGR if is_anchor else _GRID_BGR,
-                     2 if is_anchor else 1)
+            cv2.line(
+                canvas,
+                p1,
+                p2,
+                _ANCHOR_BGR if is_anchor else _GRID_BGR,
+                2 if is_anchor else 1,
+            )
             cv2.circle(canvas, p1, 3, _VTD_BGR, -1)
             cv2.circle(canvas, p2, 3, _VTD_BGR, -1)
     _poly(roof, _ROOF_BGR)
@@ -608,8 +619,9 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=(
     return canvas
 
 
-def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f,
-                           anchor_idx=()):
+def save_static_diagnostic(
+    out_path, regions, t, video_path, roof, floor, r, f, anchor_idx=()
+):
     """Vector PDF: MRI frame (resized to mask space) + translucent masks + wall
     lines + VTD grid/points, all in mask coordinates. Anchor grid lines are
     drawn magenta; interior lines cyan."""
@@ -628,25 +640,29 @@ def save_static_diagnostic(out_path, regions, t, video_path, roof, floor, r, f,
     else:
         ax.set_xlim(0, mw)
         ax.set_ylim(mh, 0)
-    for sub, m in regions.items():
-        if m is None or t >= m.shape[0] or not m[t].any():
-            continue
-        import matplotlib.colors as mcolors
+    # for sub, m in regions.items():
+    #     if m is None or t >= m.shape[0] or not m[t].any():
+    #         continue
+    #     import matplotlib.colors as mcolors
 
-        rgb = mcolors.to_rgb(_REGION_HEX.get(sub, "#888888"))
-        rgba = np.zeros((*m[t].shape, 4), np.float32)
-        rgba[..., :3] = rgb
-        rgba[..., 3] = m[t].astype(np.float32) * 0.35
-        ax.imshow(rgba, interpolation="nearest")
+    #     rgb = mcolors.to_rgb(_REGION_HEX.get(sub, "#888888"))
+    #     rgba = np.zeros((*m[t].shape, 4), np.float32)
+    #     rgba[..., :3] = rgb
+    #     rgba[..., 3] = m[t].astype(np.float32) * 0.35
+    #     ax.imshow(rgba, interpolation="nearest")
     anchor_set = set(anchor_idx)
     if r is not None and f is not None:
         for i, (u, l) in enumerate(zip(r, f)):
             if np.isnan(u[0]) or np.isnan(l[0]):
                 continue
             is_anchor = i in anchor_set
-            ax.plot([u[0], l[0]], [u[1], l[1]],
-                    color="magenta" if is_anchor else "cyan",
-                    lw=1.4 if is_anchor else 0.6, zorder=3)
+            ax.plot(
+                [u[0], l[0]],
+                [u[1], l[1]],
+                color="magenta" if is_anchor else "cyan",
+                lw=1.4 if is_anchor else 0.6,
+                zorder=3,
+            )
             ax.scatter(
                 [u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5, linewidths=0
             )
@@ -731,13 +747,17 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     L = _total_lines(n_gridlines, EVEN_TOTAL)
     a_idx = anchor_indices(n_gridlines, EVEN_TOTAL)
     with open(out_dir / "grid_meta.json", "w") as fh:
-        json.dump({
-            "n_per_cavity": n_gridlines,
-            "even_total": EVEN_TOTAL,
-            "total_lines": L,
-            "anchor_indices": a_idx,
-            "anchor_names": ["lips", "velum", "tongue_back"],
-        }, fh, indent=2)
+        json.dump(
+            {
+                "n_per_cavity": n_gridlines,
+                "even_total": EVEN_TOTAL,
+                "total_lines": L,
+                "anchor_indices": a_idx,
+                "anchor_names": ["lips", "velum", "tongue_back"],
+            },
+            fh,
+            indent=2,
+        )
 
     per_video = {}  # basename -> (mask_path, video_path, T)
     all_vtd = []
@@ -856,19 +876,26 @@ def main():
             metavar="N",
             help=f"Speaker numbers (prefix '{SPK_BASE}'). Default: all.",
         )
-    p.add_argument("--n-gridlines", type=int, default=N_GRIDLINES,
-                   help="Interior lines per cavity (n). Total = 2n+2 (even) or 2n+3 (odd).")
+    p.add_argument(
+        "--n-gridlines",
+        type=int,
+        default=N_GRIDLINES,
+        help="Interior lines per cavity (n). Total = 2n+2 (even) or 2n+3 (odd).",
+    )
     p.add_argument("--n-videos", type=int, default=N_DIAGNOSTIC)
     p.add_argument("--bins", type=int, default=N_BINS)
     p.add_argument("--upscale", type=int, default=UPSCALE)
     p.add_argument("--pre-sigma", type=float, default=PRE_SIGMA)
     p.add_argument("--sigma-path", type=float, default=SIGMA_PATH)
-    p.add_argument("--parity", choices=["even", "odd"],
-                   default="even" if EVEN_TOTAL else "odd",
-                   help="even -> 2n+2 grid lines; odd -> 2n+3.")
+    p.add_argument(
+        "--parity",
+        choices=["even", "odd"],
+        default="even" if EVEN_TOTAL else "odd",
+        help="even -> 2n+2 grid lines; odd -> 2n+3.",
+    )
     args = p.parse_args()
     UPSCALE, PRE_SIGMA, SIGMA_PATH = args.upscale, args.pre_sigma, args.sigma_path
-    EVEN_TOTAL = (args.parity == "even")
+    EVEN_TOTAL = args.parity == "even"
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")
