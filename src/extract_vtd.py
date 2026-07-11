@@ -17,12 +17,12 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
          tongue reaches (constriction region; not to the wall's bottom).
 
   FLOOR (lower wall), one continuous line, front -> back:
-    top (airway-facing) edge of "lower lip - jaw" — front-cavity overhang removal
-    drops any lip point that has a floor point above it and not to its right
-    (up-and-left OR directly above), i.e. under the tongue, below the lip
-    aperture, or a vertical overhang, so the front floor is monotone and its
-    connectors don't cross -> tongue airway-facing contour (dorsum from the jaw
-    junction to the root, then down the posterior/backside edge to the bottom).
+    the lower lip's APERTURE point (top-most / inner-upper corner of "lower lip -
+    jaw") connected straight to the tongue's airway-facing contour (dorsum from
+    the jaw junction to the root, then down the posterior/backside edge to the
+    bottom). The lower-lip/jaw top edge is NOT traced back toward the jaw — that
+    would place floor points under the tongue. Constrictions are formed against
+    the tongue upper surface, so the floor follows that surface.
 
 VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
 the tongue back — split each wall into an oral cavity (lips->velum) and a
@@ -442,24 +442,18 @@ def build_floor(reg_up: dict, jaw_ref_up):
         return None
     parts = [upper]
     lower = reg_up.get(LOWER_LIP_SUB)
-    if lower is not None:
-        low = _top_edge(lower)  # ascending x (airway-facing top of lip)
-        if len(low) >= 1:
-            # Front-cavity overhang removal: drop a lip point if ANY floor point
-            # (lip or tongue) is above it and NOT to its right — i.e. up-and-left
-            # OR directly above (same column). This removes points under the
-            # tongue, anterior dips below the lip aperture, and vertical
-            # overhangs, leaving a monotone front floor whose connectors don't
-            # cross. Scoped to the lip, so the tongue dorsum and the descending
-            # backside (pharyngeal cavity) are left intact.
-            ref = np.vstack([low, upper])
-            rx = ref[:, 0][None, :]
-            ry = ref[:, 1][None, :]
-            drop = ((rx <= low[:, 0:1] + 0.5 * U) &
-                    (ry < low[:, 1:2] - 0.5 * U)).any(axis=1)
-            low = low[~drop]
-            if len(low) >= 1:
-                parts = [low, upper]
+    if lower is not None and lower.any():
+        # Use ONLY the lower lip's aperture point (its top-most / inner-upper
+        # corner) and connect it straight to the tongue's upper surface. We do
+        # NOT trace the lower-lip/jaw top edge back toward the jaw, because that
+        # puts floor points under the tongue and makes connectors cross it.
+        # Constrictions are formed against the tongue UPPER surface, so the floor
+        # is simply: lip aperture -> tongue upper surface.
+        ys, xs = np.where(lower)
+        y0 = int(ys.min())
+        x0 = float(xs[ys == y0].min())          # front-most of the top-most row
+        lip_pt = np.array([[x0, float(y0)]], np.float32)
+        parts = [lip_pt, upper]
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
 
