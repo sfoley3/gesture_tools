@@ -270,11 +270,42 @@ def _find_jaw_anchor(tongue_masks, lower_lip_masks):
     return float(np.median(a[:, 0])), float(np.median(a[:, 1]))
 
 
+def _walk_backside(pts, idx_root):
+    """From the tongue root (right-most contour point) walk along the contour in
+    the increasing-y direction (down the posterior/airway-facing edge), then
+    TRUNCATE at the lowest point (max y). This follows the backside of a curled
+    tongue root down to the bottom but does not continue leftward along the
+    underside (which would make connectors cross). Returns (K,2) from the root
+    to the bottom."""
+    n = len(pts)
+    y_next = pts[(idx_root + 1) % n, 1]
+    y_prev = pts[(idx_root - 1) % n, 1]
+    step = 1 if y_next >= y_prev else -1     # direction that goes downward
+    path = [pts[idx_root]]
+    running_max = float(pts[idx_root, 1])
+    i = idx_root
+    for _ in range(n // 2):
+        j = (i + step) % n
+        path.append(pts[j])
+        running_max = max(running_max, float(pts[j, 1]))
+        if float(pts[j, 1]) < running_max - 3.0:   # clearly past the bottom
+            break
+        i = j
+    path = np.asarray(path, np.float32)
+    cut = int(np.argmax(path[:, 1]))         # stop at the lowest (max-y) point
+    return path[: cut + 1]
+
+
 def extract_upper_contour(mask_up, jaw_ref_up):
-    """Upper (oral-cavity-facing) tongue surface from a single upscaled mask.
-    Splits the outer contour at anterior (jaw junction) and posterior (root =
-    right-most) anchors and keeps the upper path. Returns (M, 2) anterior->
-    posterior in UPSCALED coords, or None."""
+    """Airway-facing tongue surface from a single upscaled mask.
+
+    Splits the outer contour at an anterior anchor (the jaw junction, which
+    delineates the tongue front underside) and the right-most point (tongue
+    root), and keeps the airway-facing (upper) path along the dorsum. Then it
+    CONTINUES down the posterior edge from the root to the tongue's bottom, so a
+    curled tongue back is captured (its wall-facing backside), without wrapping
+    under the tongue. Returns (M, 2) anterior->posterior in UPSCALED coords, or
+    None."""
     if mask_up is None or not mask_up.any():
         return None
     cs, _ = cv2.findContours(mask_up, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -283,7 +314,7 @@ def extract_upper_contour(mask_up, jaw_ref_up):
     pts = max(cs, key=len).squeeze()
     if pts.ndim != 2 or len(pts) < 4:
         return None
-    idx_root = int(pts[:, 0].argmax())
+    idx_root = int(pts[:, 0].argmax())       # right-most = tongue root
     if jaw_ref_up is not None:
         rx, ry = jaw_ref_up
         idx_j = int(((pts[:, 0] - rx) ** 2 + (pts[:, 1] - ry) ** 2).argmin())
@@ -294,7 +325,11 @@ def extract_upper_contour(mask_up, jaw_ref_up):
     path_b = np.concatenate([pts[b:], pts[: a + 1]])
     upper = path_a if path_a[:, 1].mean() <= path_b[:, 1].mean() else path_b
     if upper[0, 0] > upper[-1, 0]:
-        upper = upper[::-1]
+        upper = upper[::-1]                   # anterior -> posterior (ends at root)
+    # Extend down the posterior/backside edge to the tongue bottom.
+    backside = _walk_backside(pts, idx_root)
+    if len(backside) > 1:
+        upper = np.concatenate([upper, backside[1:]], axis=0)
     return upper.astype(np.float32)
 
 
@@ -389,10 +424,14 @@ def build_roof(reg_up: dict):
 
 
 def build_floor(reg_up: dict, jaw_ref_up):
-    """One line, front -> back, in original coords:
-    lower-lip top edge  ->(spliced where it meets the tongue)->  tongue upper
-    surface (contour method) down to the root. The lip is cut at the junction
-    so the floor never dips below the tongue contour. Returns (M,2) or None."""
+    """One line, front -> back, in original coords: lower-lip top edge ->
+    tongue airway-facing contour down to the back-bottom.
+
+    The lower-lip/jaw edge may legitimately run BELOW the tongue (the mouth
+    floor), but those points are not the airway floor — using them would make a
+    grid connector cross the tongue surface. So we drop only the lip points that
+    sit under the tongue (a tongue point is above them at the same x); anterior
+    lip points are kept even where they are low. Returns (M,2) or None."""
     U = UPSCALE
     tongue = reg_up.get(TONGUE_SUB)
     upper = extract_upper_contour(tongue, jaw_ref_up) if tongue is not None else None
@@ -402,9 +441,14 @@ def build_floor(reg_up: dict, jaw_ref_up):
     lower = reg_up.get(LOWER_LIP_SUB)
     if lower is not None:
         low = _top_edge(lower)  # ascending x (airway-facing top of lip)
-        if len(low) >= 2:
-            i, j = _closest_pair(low, upper)  # where lower lip meets the tongue
-            parts = [low[: i + 1], upper[j:]]
+        if len(low) >= 1:
+            # drop lip points that lie under the tongue (tongue above at same x)
+            _, idx = cKDTree(upper[:, :1]).query(low[:, :1])
+            under = (np.abs(low[:, 0] - upper[idx, 0]) < 1.5 * U) & \
+                    (low[:, 1] > upper[idx, 1] + 0.5 * U)
+            low = low[~under]
+            if len(low) >= 1:
+                parts = [low, upper]
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
 
