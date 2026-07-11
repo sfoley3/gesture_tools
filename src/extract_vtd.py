@@ -17,12 +17,11 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
          tongue reaches (constriction region; not to the wall's bottom).
 
   FLOOR (lower wall), one continuous line, front -> back:
-    the lower lip's APERTURE point (top-most / inner-upper corner of "lower lip -
-    jaw") connected straight to the tongue's airway-facing contour (dorsum from
-    the jaw junction to the root, then down the posterior/backside edge to the
-    bottom). The lower-lip/jaw top edge is NOT traced back toward the jaw — that
-    would place floor points under the tongue. Constrictions are formed against
-    the tongue upper surface, so the floor follows that surface.
+    the lower lip's UPPER edge connected to the tongue's UPPER edge. The tongue
+    contour is anchored at the tongue TIP (not the jaw junction) so it does not
+    dip down to the jaw; the lip upper edge is spliced to the tongue upper edge
+    where they meet. The tongue upper edge runs from the tip along the dorsum to
+    the root, then down the posterior/backside edge to the tongue bottom.
 
 VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
 the tongue back — split each wall into an oral cavity (lips->velum) and a
@@ -426,34 +425,27 @@ def build_roof(reg_up: dict):
     return _smooth_path(line, SIGMA_PATH)
 
 
-def build_floor(reg_up: dict, jaw_ref_up):
-    """One line, front -> back, in original coords: lower-lip top edge ->
-    tongue airway-facing contour down to the back-bottom.
+def build_floor(reg_up: dict, jaw_ref_up=None):
+    """One line, front -> back, in original coords: the lower lip's UPPER edge
+    connected to the tongue's UPPER edge (dorsum + backside).
 
-    The lower-lip/jaw edge may legitimately run BELOW the tongue (the mouth
-    floor), but those points are not the airway floor — using them would make a
-    grid connector cross the tongue surface. So we drop only the lip points that
-    sit under the tongue (a tongue point is above them at the same x); anterior
-    lip points are kept even where they are low. Returns (M,2) or None."""
+    The tongue contour is anchored at the tongue TIP (left-most point), NOT the
+    jaw junction, so it does not dip down to the jaw. The lower-lip upper edge is
+    spliced to the tongue upper edge where the two meet (closest pair), giving a
+    smooth upper edge derived from the lower lip and tongue. Returns (M,2) or
+    None."""
     U = UPSCALE
     tongue = reg_up.get(TONGUE_SUB)
-    upper = extract_upper_contour(tongue, jaw_ref_up) if tongue is not None else None
+    upper = extract_upper_contour(tongue, None) if tongue is not None else None
     if upper is None or len(upper) < 2:
         return None
     parts = [upper]
     lower = reg_up.get(LOWER_LIP_SUB)
     if lower is not None and lower.any():
-        # Use ONLY the lower lip's aperture point (its top-most / inner-upper
-        # corner) and connect it straight to the tongue's upper surface. We do
-        # NOT trace the lower-lip/jaw top edge back toward the jaw, because that
-        # puts floor points under the tongue and makes connectors cross it.
-        # Constrictions are formed against the tongue UPPER surface, so the floor
-        # is simply: lip aperture -> tongue upper surface.
-        ys, xs = np.where(lower)
-        y0 = int(ys.min())
-        x0 = float(xs[ys == y0].min())          # front-most of the top-most row
-        lip_pt = np.array([[x0, float(y0)]], np.float32)
-        parts = [lip_pt, upper]
+        low = _top_edge(lower)  # lower-lip upper (airway-facing) edge
+        if len(low) >= 2:
+            i, j = _closest_pair(low, upper)  # where the lip meets the tongue
+            parts = [low[: i + 1], upper[j:]]
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
 
