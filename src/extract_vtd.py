@@ -21,7 +21,9 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
     tongue root — the lip aperture where only the lip is present, the tongue
     dorsum wherever the tongue is present (the higher surface), so it never dips
     under the tongue or onto the jaw and never misses the tongue -> tongue
-    posterior/backside edge from the root down to the bottom.
+    posterior/backside edge from the root down, cut off at the backside point
+    closest to the lowest point of the pharyngeal wall (so it does not curl too
+    far under the tongue).
 
 VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
 the tongue back — split each wall into an oral cavity (lips->velum) and a
@@ -476,7 +478,19 @@ def build_floor(reg_up: dict, jaw_ref_up=None):
 
     backside = _tongue_backside(tongue)            # root -> bottom (posterior)
     if backside is not None and len(backside) > 1:
-        parts.append(backside)
+        # Limit how far the backside descends/curls under: find the backside point
+        # closest to the LOWEST point of the pharyngeal wall, and cut any backside
+        # points left (anterior) of it. This point is only a cutoff — it is not
+        # added as an endpoint.
+        wall = reg_up.get(PHARYNX_SUB)
+        if wall is not None and wall.any():
+            wy, wx = np.where(wall)
+            i_low = int(wy.argmax())               # lowest wall pixel (max y)
+            w_low = np.array([float(wx[i_low]), float(wy[i_low])], np.float32)
+            cut_x = float(backside[((backside - w_low[None, :]) ** 2).sum(1).argmin(), 0])
+            backside = backside[backside[:, 0] >= cut_x - 0.5]
+        if len(backside) >= 1:
+            parts.append(backside)
 
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
