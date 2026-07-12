@@ -17,11 +17,11 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
          tongue reaches (constriction region; not to the wall's bottom).
 
   FLOOR (lower wall), one continuous line, front -> back:
-    the lower lip's UPPER edge connected to the tongue's UPPER edge. The tongue
-    contour is anchored at the tongue TIP (not the jaw junction) so it does not
-    dip down to the jaw; the lip upper edge is spliced to the tongue upper edge
-    where they meet. The tongue upper edge runs from the tip along the dorsum to
-    the root, then down the posterior/backside edge to the tongue bottom.
+    per-column TOP-most edge of (tongue UNION lower-lip) from the lips to the
+    tongue root — the lip aperture where only the lip is present, the tongue
+    dorsum wherever the tongue is present (the higher surface), so it never dips
+    under the tongue or onto the jaw and never misses the tongue -> tongue
+    posterior/backside edge from the root down to the bottom.
 
 VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
 the tongue back — split each wall into an oral cavity (lips->velum) and a
@@ -425,27 +425,59 @@ def build_roof(reg_up: dict):
     return _smooth_path(line, SIGMA_PATH)
 
 
-def build_floor(reg_up: dict, jaw_ref_up=None):
-    """One line, front -> back, in original coords: the lower lip's UPPER edge
-    connected to the tongue's UPPER edge (dorsum + backside).
+def _tongue_backside(tongue_mask):
+    """Posterior/backside edge of the tongue: the contour arc from the right-most
+    point (root) to the bottom-most point, taken on the higher-x (airway/wall-
+    facing) side, oriented root(top) -> bottom. Returns (K,2) upscaled or None."""
+    core = _largest_component(tongue_mask.astype(bool)).astype(np.uint8)
+    cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cs:
+        return None
+    pts = max(cs, key=len).squeeze()
+    if pts.ndim != 2 or len(pts) < 4:
+        return None
+    root = int(pts[:, 0].argmax())        # right-most (tongue root)
+    bottom = int(pts[:, 1].argmax())      # bottom-most
+    if root == bottom:
+        return None
+    a, b = sorted([root, bottom])
+    arc1 = pts[a: b + 1]
+    arc2 = np.concatenate([pts[b:], pts[: a + 1]])
+    arc = arc1 if arc1[:, 0].mean() >= arc2[:, 0].mean() else arc2   # posterior side
+    if arc[0, 1] > arc[-1, 1]:             # orient top (root) -> bottom
+        arc = arc[::-1]
+    return arc.astype(np.float32)
 
-    The tongue contour is anchored at the tongue TIP (left-most point), NOT the
-    jaw junction, so it does not dip down to the jaw. The lower-lip upper edge is
-    spliced to the tongue upper edge where the two meet (closest pair), giving a
-    smooth upper edge derived from the lower lip and tongue. Returns (M,2) or
-    None."""
+
+def build_floor(reg_up: dict, jaw_ref_up=None):
+    """One line, front -> back, in original coords: a single airway-facing upper
+    edge from the lip through the tongue, then down the tongue backside.
+
+    Front edge = per-column TOP-most pixel of (tongue UNION lower-lip), from the
+    lips to the tongue root: it follows the lip aperture where only the lip is
+    present and the tongue dorsum wherever the tongue is present (the tongue is
+    the higher surface), so it can never dip under the tongue or onto the jaw
+    below it, and never misses the tongue. Back edge = the tongue posterior edge
+    from the root down to the bottom. Returns (M,2) or None."""
     U = UPSCALE
     tongue = reg_up.get(TONGUE_SUB)
-    upper = extract_upper_contour(tongue, None) if tongue is not None else None
-    if upper is None or len(upper) < 2:
+    if tongue is None or not tongue.any():
         return None
-    parts = [upper]
     lower = reg_up.get(LOWER_LIP_SUB)
+    union = tongue.astype(bool)
     if lower is not None and lower.any():
-        low = _top_edge(lower)  # lower-lip upper (airway-facing) edge
-        if len(low) >= 2:
-            i, j = _closest_pair(low, upper)  # where the lip meets the tongue
-            parts = [low[: i + 1], upper[j:]]
+        union = union | lower.astype(bool)
+    front = _top_edge(union.astype(np.uint8))     # lip aperture -> tongue dorsum
+    if front is None or len(front) < 2:
+        return None
+    root_x = float(np.where(tongue)[1].max())
+    front = front[front[:, 0] <= root_x + 0.5]     # stop at the tongue root
+    parts = [front]
+
+    backside = _tongue_backside(tongue)            # root -> bottom (posterior)
+    if backside is not None and len(backside) > 1:
+        parts.append(backside)
+
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
 
