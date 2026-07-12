@@ -17,8 +17,9 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
          tongue reaches (constriction region; not to the wall's bottom).
 
   FLOOR (lower wall), one continuous line, front -> back:
-    per-column TOP-most edge of (tongue UNION lower-lip) from the lips to the
-    tongue root — the lip aperture where only the lip is present, the tongue
+    starts at the LIP APERTURE (the lower-lip point closest to the upper lip, so
+    it never sits below the upper-lip edge), then the per-column TOP-most edge of
+    (tongue UNION lower-lip) from the lips to the tongue root — the tongue
     dorsum wherever the tongue is present (the higher surface), so it never dips
     under the tongue or onto the jaw and never misses the tongue -> tongue
     posterior/backside edge from the root down, cut off at the backside point
@@ -474,6 +475,20 @@ def build_floor(reg_up: dict, jaw_ref_up=None):
         return None
     root_x = float(np.where(tongue)[1].max())
     front = front[front[:, 0] <= root_x + 0.5]     # stop at the tongue root
+
+    # Anterior start = the LIP APERTURE: the lower-lip point closest to the upper
+    # lip (closest pair between the two lip masks). Forcing the floor to start
+    # here guarantees the first point never sits below the upper-lip edge.
+    upper_lip = reg_up.get(ROOF_FRONT_SUB)
+    if (upper_lip is not None and upper_lip.any()
+            and lower is not None and lower.any()):
+        ub = _bottom_edge(upper_lip)              # upper-lip airway-facing edge
+        lt = _top_edge(lower)                     # lower-lip airway-facing edge
+        if len(ub) and len(lt):
+            d, _idx = cKDTree(ub).query(lt)
+            aperture = lt[int(d.argmin())]        # lower-lip aperture point
+            front = front[front[:, 0] > aperture[0] + 0.5]
+            front = np.vstack([aperture[None, :], front])
     parts = [front]
 
     backside = _tongue_backside(tongue)            # root -> bottom (posterior)
