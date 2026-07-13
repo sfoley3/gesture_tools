@@ -285,7 +285,7 @@ def _walk_backside(pts, idx_root):
     n = len(pts)
     y_next = pts[(idx_root + 1) % n, 1]
     y_prev = pts[(idx_root - 1) % n, 1]
-    step = 1 if y_next >= y_prev else -1     # direction that goes downward
+    step = 1 if y_next >= y_prev else -1  # direction that goes downward
     path = [pts[idx_root]]
     running_max = float(pts[idx_root, 1])
     i = idx_root
@@ -293,11 +293,11 @@ def _walk_backside(pts, idx_root):
         j = (i + step) % n
         path.append(pts[j])
         running_max = max(running_max, float(pts[j, 1]))
-        if float(pts[j, 1]) < running_max - 3.0:   # clearly past the bottom
+        if float(pts[j, 1]) < running_max - 3.0:  # clearly past the bottom
             break
         i = j
     path = np.asarray(path, np.float32)
-    cut = int(np.argmax(path[:, 1]))         # stop at the lowest (max-y) point
+    cut = int(np.argmax(path[:, 1]))  # stop at the lowest (max-y) point
     return path[: cut + 1]
 
 
@@ -319,7 +319,7 @@ def extract_upper_contour(mask_up, jaw_ref_up):
     pts = max(cs, key=len).squeeze()
     if pts.ndim != 2 or len(pts) < 4:
         return None
-    idx_root = int(pts[:, 0].argmax())       # right-most = tongue root
+    idx_root = int(pts[:, 0].argmax())  # right-most = tongue root
     if jaw_ref_up is not None:
         rx, ry = jaw_ref_up
         idx_j = int(((pts[:, 0] - rx) ** 2 + (pts[:, 1] - ry) ** 2).argmin())
@@ -330,7 +330,7 @@ def extract_upper_contour(mask_up, jaw_ref_up):
     path_b = np.concatenate([pts[b:], pts[: a + 1]])
     upper = path_a if path_a[:, 1].mean() <= path_b[:, 1].mean() else path_b
     if upper[0, 0] > upper[-1, 0]:
-        upper = upper[::-1]                   # anterior -> posterior (ends at root)
+        upper = upper[::-1]  # anterior -> posterior (ends at root)
     # Extend down the posterior/backside edge to the tongue bottom.
     backside = _walk_backside(pts, idx_root)
     if len(backside) > 1:
@@ -439,15 +439,15 @@ def _tongue_backside(tongue_mask):
     pts = max(cs, key=len).squeeze()
     if pts.ndim != 2 or len(pts) < 4:
         return None
-    root = int(pts[:, 0].argmax())        # right-most (tongue root)
-    bottom = int(pts[:, 1].argmax())      # bottom-most
+    root = int(pts[:, 0].argmax())  # right-most (tongue root)
+    bottom = int(pts[:, 1].argmax())  # bottom-most
     if root == bottom:
         return None
     a, b = sorted([root, bottom])
-    arc1 = pts[a: b + 1]
+    arc1 = pts[a : b + 1]
     arc2 = np.concatenate([pts[b:], pts[: a + 1]])
-    arc = arc1 if arc1[:, 0].mean() >= arc2[:, 0].mean() else arc2   # posterior side
-    if arc[0, 1] > arc[-1, 1]:             # orient top (root) -> bottom
+    arc = arc1 if arc1[:, 0].mean() >= arc2[:, 0].mean() else arc2  # posterior side
+    if arc[0, 1] > arc[-1, 1]:  # orient top (root) -> bottom
         arc = arc[::-1]
     return arc.astype(np.float32)
 
@@ -470,28 +470,27 @@ def build_floor(reg_up: dict, jaw_ref_up=None):
     union = tongue.astype(bool)
     if lower is not None and lower.any():
         union = union | lower.astype(bool)
-    front = _top_edge(union.astype(np.uint8))     # lip aperture -> tongue dorsum
+    front = _top_edge(union.astype(np.uint8))  # lip aperture -> tongue dorsum
     if front is None or len(front) < 2:
         return None
     root_x = float(np.where(tongue)[1].max())
-    front = front[front[:, 0] <= root_x + 0.5]     # stop at the tongue root
+    front = front[front[:, 0] <= root_x + 0.5]  # stop at the tongue root
 
     # Anterior start = the LIP APERTURE: the lower-lip point closest to the upper
     # lip (closest pair between the two lip masks). Forcing the floor to start
     # here guarantees the first point never sits below the upper-lip edge.
     upper_lip = reg_up.get(ROOF_FRONT_SUB)
-    if (upper_lip is not None and upper_lip.any()
-            and lower is not None and lower.any()):
-        ub = _bottom_edge(upper_lip)              # upper-lip airway-facing edge
-        lt = _top_edge(lower)                     # lower-lip airway-facing edge
+    if upper_lip is not None and upper_lip.any() and lower is not None and lower.any():
+        ub = _bottom_edge(upper_lip)  # upper-lip airway-facing edge
+        lt = _top_edge(lower)  # lower-lip airway-facing edge
         if len(ub) and len(lt):
             d, _idx = cKDTree(ub).query(lt)
-            aperture = lt[int(d.argmin())]        # lower-lip aperture point
+            aperture = lt[int(d.argmin())]  # lower-lip aperture point
             front = front[front[:, 0] > aperture[0] + 0.5]
             front = np.vstack([aperture[None, :], front])
     parts = [front]
 
-    backside = _tongue_backside(tongue)            # root -> bottom (posterior)
+    backside = _tongue_backside(tongue)  # root -> bottom (posterior)
     if backside is not None and len(backside) > 1:
         # Limit how far the backside descends/curls under: find the backside point
         # closest to the LOWEST point of the pharyngeal wall, and cut any backside
@@ -500,9 +499,11 @@ def build_floor(reg_up: dict, jaw_ref_up=None):
         wall = reg_up.get(PHARYNX_SUB)
         if wall is not None and wall.any():
             wy, wx = np.where(wall)
-            i_low = int(wy.argmax())               # lowest wall pixel (max y)
+            i_low = int(wy.argmax())  # lowest wall pixel (max y)
             w_low = np.array([float(wx[i_low]), float(wy[i_low])], np.float32)
-            cut_x = float(backside[((backside - w_low[None, :]) ** 2).sum(1).argmin(), 0])
+            cut_x = float(
+                backside[((backside - w_low[None, :]) ** 2).sum(1).argmin(), 0]
+            )
             backside = backside[backside[:, 0] >= cut_x - 0.5]
         if len(backside) >= 1:
             parts.append(backside)
