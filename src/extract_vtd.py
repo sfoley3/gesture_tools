@@ -390,6 +390,23 @@ def build_roof(reg_up: dict):
     pal = _bottom_edge(palate)  # ascending x (lips -> hard palate)
     if len(pal) < 2:
         return None
+
+    # Anterior start = the LIP APERTURE on the UPPER lip: the upper-lip bottom-edge
+    # point closest to the lower lip (the SAME closest pair the floor uses for its
+    # start). Without this, pal[0] is the front/left face of the upper lip — the
+    # per-column bottom pixels there run DOWN the lip's near-vertical front edge and
+    # hang below the true aperture, so the lips anchor connects that stray corner
+    # instead of the two closest lip points. Trimming to the aperture drops it.
+    lower = reg_up.get(LOWER_LIP_SUB)
+    if lower is not None and lower.any():
+        lt = _top_edge(lower)  # lower-lip airway-facing edge
+        if len(lt):
+            d, idx = cKDTree(pal).query(lt)  # nearest upper-edge pt per lower pt
+            aperture = pal[int(idx[int(d.argmin())])]  # upper-lip aperture point
+            kept = pal[pal[:, 0] >= aperture[0] - 0.5]  # drop the front/left face
+            pal = kept if len(kept) >= 2 else pal
+            if not np.allclose(pal[0], aperture):
+                pal = np.vstack([aperture[None, :], pal])
     parts = [pal]
     tail = pal[-1]
 
