@@ -91,7 +91,8 @@ def _valid_xy(arr, t):
 
 def draw_left_overlay(ax, pts, t):
     """Draw tracked-point dots and lip-pair line at frame t."""
-    for key in ("velum_centroids", "tt_points", "tb_tongue_pts", "tr_root_pts"):
+    for key in ("velum_centroids", "tt_points", "tb_tongue_pts", "tr_root_pts",
+                "jaw_pts"):
         xy = _valid_xy(np.asarray(pts[key]) if key in pts else None, t)
         if xy is not None:
             ax.scatter([xy[0]], [xy[1]], s=POINT_SIZE,
