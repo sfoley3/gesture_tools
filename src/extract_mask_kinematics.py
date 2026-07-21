@@ -6,9 +6,12 @@ Processes SAM2 segmentation masks to extract raw articulatory kinematic timeseri
 
 For each speaker × video:
   - Velum: tip position (x, y) in 104×104 pixel space — right-half centroid of largest component
-  - Tongue tip: distance to alveolar ridge reference point
+  - Tongue tip: tongue pixel nearest a fixed alveolar-ridge reference (segments
+    the tip); value is its distance to the nearest palate / upper-lip pixel,
+    recomputed per frame
   - Lip aperture: distance between closest points on lower lip and upper lip masks
-  - Tongue body: distance from closest tongue pixel to leftmost velum pixel (per-frame)
+  - Tongue body: fixed (time-averaged) velar reference selects the tongue point;
+    value is its distance to the nearest palate-or-velum pixel, per frame
   - Tongue root: distance from rightmost tongue pixel y-coordinate to max y (104)
   - Jaw: y-coordinate of the bottom-left extreme of the lower-lip / jaw mask
   - Larynx: y-coordinate of mask centroid
@@ -242,61 +245,82 @@ def compute_velum_kinematics(velum_masks: np.ndarray):
     return _fill_nans(x), _fill_nans(y)
 
 
-def _find_alveolar_ridge(palate_masks: np.ndarray) -> tuple:
+def _find_leading_edge(masks: np.ndarray, active_frac: float = 0.1) -> tuple:
     """
-    Derive a fixed alveolar ridge reference point from the time-averaged palate mask.
-    Front of mouth is on the left side of the frame (minimum x).
-    Returns (x_ar, y_ar) in mask pixel space.
+    Derive a FIXED anterior reference point from a time-averaged mask: the
+    vertical centroid of its leftmost occupied column. Front of mouth is the
+    left of the frame (minimum x).
+
+    Used as the stage-1 selector for both TT and TB — applied to the palate it
+    gives the alveolar ridge, applied to the velum it gives a velar reference.
+    Averaging over the utterance means the same anatomical landmark is selected
+    every frame, so the tracked tongue point does not migrate as the reference
+    structure moves. The per-frame position of those structures still enters
+    the measurement in stage 2.
+
+    Returns (x, y) in mask pixel space.
     """
-    # Average mask across frames to find the stable palate region
-    avg = palate_masks.mean(axis=0)
-    active = avg > 0.1  # pixels active in >10% of frames
+    avg = masks.mean(axis=0)
+    active = avg > active_frac  # pixels active in >active_frac of frames
     if not active.any():
-        active = palate_masks.any(axis=0)
-    ys, xs = np.where(active)
-    # Leftmost column where palate is present
-    x_ar = int(xs.min())
-    # Vertical centroid at that x column
-    col_mask = active[:, x_ar]
-    y_ar = float(np.where(col_mask)[0].mean())
-    return float(x_ar), y_ar
+        active = masks.any(axis=0)
+    _, xs = np.where(active)
+    x_ref = int(xs.min())
+    y_ref = float(np.where(active[:, x_ref])[0].mean())
+    return float(x_ref), y_ref
 
 
 def compute_tt_kinematics(tongue_masks: np.ndarray, palate_masks: np.ndarray):
     """
     tongue_masks, palate_masks: (T, H, W) bool
-    Tracks the tongue pixel closest to a fixed alveolar ridge reference point.
-    Returns raw dist array of shape (T,), float32.
-    Also returns tt_points array (T, 2) and the alveolar ridge point (x_ar, y_ar).
+
+    Two deliberately separate stages:
+
+    1. SEGMENT the tongue tip. A fixed alveolar ridge reference
+       (_find_leading_edge of the time-averaged palate) selects, per frame, the
+       tongue pixel closest to it. The reference is constant across the
+       utterance, so the same anatomical part of the tongue is picked out each
+       frame.
+
+    2. MEASURE constriction degree. The returned distance is from that tip to
+       the nearest palate / upper-lip pixel *in that frame* — not to the fixed
+       reference. Both endpoints therefore move with the articulators, so the
+       value tracks the actual closing gesture rather than displacement from a
+       static point.
+
+    Returns (dist, tt_points, tt_palate_pts) — dist is (T,), points are (T, 2).
     """
     T = tongue_masks.shape[0]
     dist = np.full(T, np.nan, dtype=np.float32)
     tt_points = np.full((T, 2), np.nan, dtype=np.float32)
+    pal_points = np.full((T, 2), np.nan, dtype=np.float32)
 
-    x_ar, y_ar = _find_alveolar_ridge(palate_masks)
+    x_ar, y_ar = _find_leading_edge(palate_masks)
 
     for t in range(T):
         tmask = tongue_masks[t]
-        if not tmask.any():
+        pmask = palate_masks[t]
+        if not tmask.any() or not pmask.any():
             continue
+
+        # 1. Tip = tongue pixel closest to the fixed alveolar ridge reference.
         ys, xs = np.where(tmask)
-        # Euclidean distance from each tongue pixel to the fixed alveolar ridge point
-        dists = np.sqrt((xs - x_ar) ** 2 + (ys - y_ar) ** 2)
-        idx = dists.argmin()
-        tt_points[t, 0] = float(xs[idx])
-        tt_points[t, 1] = float(ys[idx])
-        dist[t] = dists[idx]
+        i = int(np.argmin((xs - x_ar) ** 2 + (ys - y_ar) ** 2))
+        tip_x, tip_y = float(xs[i]), float(ys[i])
+
+        # 2. Distance from that tip to the nearest palate pixel this frame.
+        py, px = np.where(pmask)
+        d = np.sqrt((px - tip_x) ** 2 + (py - tip_y) ** 2)
+        j = int(d.argmin())
+
+        tt_points[t] = [tip_x, tip_y]
+        pal_points[t] = [float(px[j]), float(py[j])]
+        dist[t] = float(d[j])
 
     dist = _fill_nans(dist)
-    # Fill tt_points to match (forward then backward)
-    for i in range(1, T):
-        if np.isnan(tt_points[i, 0]):
-            tt_points[i] = tt_points[i - 1]
-    for i in range(T - 2, -1, -1):
-        if np.isnan(tt_points[i, 0]):
-            tt_points[i] = tt_points[i + 1]
-
-    return dist, tt_points, (x_ar, y_ar)
+    tt_points = _fill_nans_2d(tt_points)
+    pal_points = _fill_nans_2d(pal_points)
+    return dist, tt_points, pal_points
 
 
 def _fill_nans_2d(arr: np.ndarray) -> np.ndarray:
@@ -369,44 +393,72 @@ def compute_lip_aperture(lower_lip_masks: np.ndarray, palate_masks: np.ndarray):
     return dist, upper_pts, lower_pts
 
 
-def compute_tongue_body(tongue_masks: np.ndarray, velum_masks: np.ndarray):
+def compute_tongue_body(
+    tongue_masks: np.ndarray,
+    velum_masks: np.ndarray,
+    palate_masks: np.ndarray | None = None,
+):
     """
-    tongue_masks, velum_masks: (T, H, W) bool
-    Measures tongue body constriction as the distance from the closest tongue pixel
-    to the leftmost point on the velum mask (computed per-frame).
-    Returns (dist, tongue_points, velum_ref_points) — dist is (T,), points are (T, 2).
+    tongue_masks, velum_masks, palate_masks: (T, H, W) bool
+
+    Two deliberately separate stages, mirroring compute_tt_kinematics:
+
+    1. SEGMENT the tongue-body point. A fixed velar reference
+       (_find_leading_edge of the time-averaged velum) selects, per frame, the
+       closest tongue pixel. Time-averaging the reference means the tracked
+       tongue point stays anatomically consistent instead of migrating along
+       the tongue as the velum raises and lowers; the velum's actual per-frame
+       position still enters the measurement in stage 2.
+
+    2. MEASURE constriction degree as the distance from that point to the
+       nearest pixel anywhere on the upper airway boundary — the union of the
+       palate / upper-lip and velum masks — so a constriction against either
+       the hard or the soft palate is captured, not just the gap to the velum
+       leading edge. Falls back to velum-only if no palate mask is supplied.
+
+    Returns (dist, tongue_points, ref_points) — dist is (T,), points are
+    (T, 2). ref_points is the measured endpoint and may lie on either mask.
     """
     T = tongue_masks.shape[0]
     dist = np.full(T, np.nan, dtype=np.float32)
     tongue_pts = np.full((T, 2), np.nan, dtype=np.float32)
-    velum_pts = np.full((T, 2), np.nan, dtype=np.float32)
+    ref_pts = np.full((T, 2), np.nan, dtype=np.float32)
+
+    ref_x, ref_y = _find_leading_edge(velum_masks)
 
     for t in range(T):
         tmask = tongue_masks[t]
-        vmask = velum_masks[t]
-        if not tmask.any() or not vmask.any():
+        if not tmask.any():
             continue
 
-        # Leftmost point on velum (min x; vertical centroid at that column for tie-break)
-        vy, vx = np.where(vmask)
-        x_min = int(vx.min())
-        col_ys = vy[vx == x_min]
-        ref_x = float(x_min)
-        ref_y = float(col_ys.mean())
-
-        # Closest tongue pixel to the velum reference
+        # 1. Fixed velar reference selects the tongue-body point.
         ty, tx = np.where(tmask)
-        dists = np.sqrt((tx - ref_x) ** 2 + (ty - ref_y) ** 2)
-        idx = dists.argmin()
+        i = int(np.argmin((tx - ref_x) ** 2 + (ty - ref_y) ** 2))
+        body_x, body_y = float(tx[i]), float(ty[i])
 
-        dist[t] = dists[idx]
-        tongue_pts[t] = [float(tx[idx]), float(ty[idx])]
-        velum_pts[t] = [ref_x, ref_y]
+        # 2. Nearest point on the upper boundary (palate union velum), using
+        #    whichever of those masks are present in this frame.
+        parts = []
+        if velum_masks[t].any():
+            parts.append(np.where(velum_masks[t]))
+        if palate_masks is not None and palate_masks[t].any():
+            parts.append(np.where(palate_masks[t]))
+        if not parts:
+            continue
+        uy = np.concatenate([p[0] for p in parts])
+        ux = np.concatenate([p[1] for p in parts])
+
+        d = np.sqrt((ux - body_x) ** 2 + (uy - body_y) ** 2)
+        j = int(d.argmin())
+
+        dist[t] = float(d[j])
+        tongue_pts[t] = [body_x, body_y]
+        ref_pts[t] = [float(ux[j]), float(uy[j])]
 
     dist = _fill_nans(dist)
     tongue_pts = _fill_nans_2d(tongue_pts)
-    velum_pts = _fill_nans_2d(velum_pts)
-    return dist, tongue_pts, velum_pts
+    ref_pts = _fill_nans_2d(ref_pts)
+    return dist, tongue_pts, ref_pts
 
 
 def compute_tongue_root(tongue_masks: np.ndarray, MAX_X: int = MAX_X):
@@ -546,11 +598,11 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     # Tongue tip (needs tongue + upper lip / palate)
     tt_points = None
     if has_tongue and has_upper_lip:
-        tt_dist, tt_points, alveolar_ridge = compute_tt_kinematics(
+        tt_dist, tt_points, tt_palate_pts = compute_tt_kinematics(
             tongue_masks, palate_masks
         )
         tracked_points["tt_points"] = tt_points
-        tracked_points["alveolar_ridge"] = alveolar_ridge
+        tracked_points["tt_palate_pts"] = tt_palate_pts
 
     # Lip aperture (needs lower lip + upper lip)
     if has_lower_lip and has_upper_lip:
@@ -562,11 +614,12 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
 
     # Tongue body (needs tongue + velum)
     if has_tongue and has_velum:
-        tb_dist, tb_tongue_pts, tb_velum_pts = compute_tongue_body(
-            tongue_masks, velum_masks
+        tb_dist, tb_tongue_pts, tb_ref_pts = compute_tongue_body(
+            tongue_masks, velum_masks, palate_masks if has_upper_lip else None
         )
         tracked_points["tb_tongue_pts"] = tb_tongue_pts
-        tracked_points["tb_velum_pts"] = tb_velum_pts
+        # Measured endpoint; may lie on the palate or the velum.
+        tracked_points["tb_ref_pts"] = tb_ref_pts
 
     # Tongue root (needs tongue)
     if has_tongue:
