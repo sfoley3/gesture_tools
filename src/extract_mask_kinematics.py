@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# ABOUTME: Extracts articulatory kinematics (velum, tongue tip, lip aperture, tongue body, tongue root, larynx) from SAM2 mask NPZ files.
-# ABOUTME: Outputs per-video NPY timeseries (T, 7) and diagnostic MP4 overlays with color-coded tracked points.
+# ABOUTME: Extracts articulatory kinematics (velum, tongue tip, lip aperture, tongue body, tongue root, jaw, larynx) from SAM2 mask NPZ files.
+# ABOUTME: Outputs per-video NPY timeseries (T, 8) and diagnostic MP4 overlays with color-coded tracked points.
 """
 Processes SAM2 segmentation masks to extract raw articulatory kinematic timeseries.
 
@@ -10,9 +10,10 @@ For each speaker × video:
   - Lip aperture: distance between closest points on lower lip and upper lip masks
   - Tongue body: distance from closest tongue pixel to leftmost velum pixel (per-frame)
   - Tongue root: distance from rightmost tongue pixel y-coordinate to max y (104)
+  - Jaw: y-coordinate of the bottom-left extreme of the lower-lip / jaw mask
   - Larynx: y-coordinate of mask centroid
 
-Output NPY shape: (T, 7) — [velum_x, velum_y, tt_dist, lip_aperture, tongue_body_dist, tongue_root_dist, larynx_y]
+Output NPY shape: (T, 8) — [velum_x, velum_y, tt_dist, lip_aperture, tongue_body_dist, tongue_root_dist, jaw_y, larynx_y]
 
 Reads config.json from the project root for data_dir, n_diagnostic, spk_base, video_dir.
 If spk_base is empty, single-speaker mode (no speaker subdirectories).
@@ -472,11 +473,13 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     and no video-derived information is used.
 
     If VELUM_PROCESSING == "pca":
-        kinematics shape: (T, 6) — [velum_pc1, tt_dist, lip_aperture,
-                                     tongue_body_dist, tongue_root_dist, larynx_y]
+        kinematics shape: (T, 7) — [velum_pc1, tt_dist, lip_aperture,
+                                     tongue_body_dist, tongue_root_dist, jaw_y,
+                                     larynx_y]
     Otherwise:
-        kinematics shape: (T, 7) — [velum_x, velum_y, tt_dist, lip_aperture,
-                                     tongue_body_dist, tongue_root_dist, larynx_y]
+        kinematics shape: (T, 8) — [velum_x, velum_y, tt_dist, lip_aperture,
+                                     tongue_body_dist, tongue_root_dist, jaw_y,
+                                     larynx_y]
 
     Only computes kinematics for masks that are present in the NPZ.
     Missing columns are filled with NaN.
@@ -526,6 +529,7 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
     la_dist = np.full(T, np.nan, dtype=np.float32)
     tb_dist = np.full(T, np.nan, dtype=np.float32)
     tr_dist = np.full(T, np.nan, dtype=np.float32)
+    jaw_y = np.full(T, np.nan, dtype=np.float32)
     larynx_y = np.full(T, np.nan, dtype=np.float32)
 
     tracked_points = {}
@@ -574,16 +578,23 @@ def extract_kinematics(mask_path: Path, video_path: Path | None) -> tuple:
         larynx_y, larynx_pts = compute_larynx_kinematics(larynx_masks)
         tracked_points["larynx_pts"] = larynx_pts
 
+    # Jaw. jaw_pts stays in tracked_points for diagnostic drawing, but the
+    # vertical (y) component is also emitted as a kinematics column so the jaw
+    # receives exactly the same LOESS smoothing and downstream handling as every
+    # other point. It sits before larynx_y so the base point columns (0..4) keep
+    # their existing indices and VL/TT/LA/TB/TR/JAW are contiguous.
     jaw_pts = compute_jaw_point(lower_lip_masks) if has_lower_lip else None
     tracked_points["jaw_pts"] = jaw_pts
+    if jaw_pts is not None:
+        jaw_y = jaw_pts[:, 1].astype(np.float32)
 
     if VELUM_PROCESSING == "pca":
         kinematics = np.stack(
-            [velum_pc1, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1
+            [velum_pc1, tt_dist, la_dist, tb_dist, tr_dist, jaw_y, larynx_y], axis=1
         ).astype(np.float32)
     else:
         kinematics = np.stack(
-            [vx, vy, tt_dist, la_dist, tb_dist, tr_dist, larynx_y], axis=1
+            [vx, vy, tt_dist, la_dist, tb_dist, tr_dist, jaw_y, larynx_y], axis=1
         ).astype(np.float32)
 
     if SMOOTH:
