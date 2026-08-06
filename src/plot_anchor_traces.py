@@ -104,29 +104,31 @@ def _plot(basename, f_edge, f_cent, f_smooth, tbx, tbx_s, tby, tby_s, out_path):
 
 def main():
     p = argparse.ArgumentParser(description="Plot raw-vs-smoothed VTD anchor traces.")
-    if ev.SPK_BASE:
-        p.add_argument("--spk", type=int, default=None, help=f"Speaker (prefix '{ev.SPK_BASE}').")
+    p.add_argument("--spk", default=None, help="Speaker dir name (e.g. ID16) or number.")
+    p.add_argument("--session", default=ev.SESSION, help="Session subdir (longitudinal).")
     p.add_argument("--n-utts", type=int, default=4, help="Number of utterances to plot.")
     p.add_argument("--median", type=int, default=int(ev.ANCHOR_SMOOTH.get("median", 5)))
     p.add_argument("--sigma", type=float, default=float(ev.ANCHOR_SMOOTH.get("sigma", 2.5)))
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    spk = getattr(args, "spk", None)
-    if ev.SPK_BASE and spk is not None:
-        base = ev.DATA_DIR / f"{ev.SPK_BASE}{spk}"
-        pattern = f"{ev.SPK_BASE}{spk}_*.npz"
+    spk = args.spk
+    if spk is not None:
+        # accept a full dir name (ID16) or a bare number with the SPK_BASE prefix.
+        name = spk if (ev.DATA_DIR / spk).is_dir() else f"{ev.SPK_BASE}{spk}"
+        base = ev.DATA_DIR / name
     else:
         base = ev.DATA_DIR
-        pattern = "*.npz"
-    mask_dir = base / "sam_seg" / "masks"
-    mask_files = sorted(mask_dir.glob(pattern))
+    session = args.session or ""
+    sess_base = base / session
+    mask_dir = sess_base / "sam_seg" / "masks"
+    mask_files = sorted(mask_dir.glob("*.npz"))
     if not mask_files:
         print(f"No mask files in {mask_dir}")
         return
     rng = random.Random(args.seed)
     chosen = rng.sample(mask_files, min(args.n_utts, len(mask_files)))
-    out_dir = base / "anchor_traces"
+    out_dir = sess_base / "anchor_traces"
 
     print(f"anchors: median={args.median} sigma={args.sigma}  ->  {out_dir}")
     print(f"{'utterance':<28} {'velum edge':>10} {'velum cent':>10} "

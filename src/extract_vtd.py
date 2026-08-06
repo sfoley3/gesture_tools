@@ -97,6 +97,7 @@ _DEFAULT_CFG = {
     "norm_method": "minmax",  # {minmax, zscore} per-speaker per-grid-line normalization
     "anchor_smooth": {"median": 5, "sigma": 2.5},  # temporal stabilization of velum/tongue-bottom anchors
     "recenter_iters": 1,  # midline medial-recentering iterations
+    "session": None,  # session subdir for longitudinal data ({spk}/{session}/...); None = flat
 }
 
 
@@ -117,6 +118,7 @@ _cfg = _load_config()
 DATA_DIR = Path(_cfg["data_dir"])
 N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 5))
 SPK_BASE = _cfg.get("spk_base", "")
+SESSION = _cfg.get("session") or None  # e.g. "D1A" for longitudinal; None = flat layout
 VIDEO_DIR = _cfg.get("video_dir", "video")
 N_GRIDLINES = int(_cfg.get("n_gridlines", 40))
 N_BINS = int(_cfg.get("n_bins", 20))
@@ -1083,24 +1085,35 @@ def write_diagnostic_video(
 def _discover_speakers():
     if not SPK_BASE:
         return []
-    return sorted(
-        d.name
-        for d in DATA_DIR.iterdir()
-        if d.is_dir()
-        and d.name.startswith(SPK_BASE)
-        and (d / "sam_seg" / "masks").is_dir()
-    )
+    if SESSION is not None:
+        return sorted(
+            d.name
+            for d in DATA_DIR.iterdir()
+            if d.is_dir()
+            # and d.name.startswith(SPK_BASE)
+            and d.name in ["ID16", "ID17", "ID18", "ID20", "ID21"]
+            and (d / SESSION / "sam_seg" / "masks").is_dir()
+        )
+    else:
+        return sorted(
+            d.name
+            for d in DATA_DIR.iterdir()
+            if d.is_dir()
+            and d.name.startswith(SPK_BASE)
+            and (d / "sam_seg" / "masks").is_dir()
+        )
 
 
 def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     base = DATA_DIR / spk if spk is not None else DATA_DIR
     label = spk if spk is not None else DATA_DIR.name
-    mask_dir = base / "sam_seg" / "masks"
-    video_dir = base / VIDEO_DIR
-    out_dir = base / f"vtd_{GRID_METHOD}_{NORM_METHOD}"
+    session = SESSION if SESSION is not None else ""
+    mask_dir = base / session / "sam_seg" / "masks"
+    video_dir = base / session / VIDEO_DIR
+    out_dir = base / session / f"vtd_{GRID_METHOD}_{NORM_METHOD}"
 
-    pattern = f"{spk}_*.npz" if spk is not None else "*.npz"
+    pattern = "*.npz"
     mask_files = sorted(mask_dir.glob(pattern))
     # mask_files = mask_files[:2]
     if not mask_files:
@@ -1274,7 +1287,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
 def main():
     global UPSCALE, PRE_SIGMA, SIGMA_PATH, EVEN_TOTAL
-    global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS
+    global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS, SESSION
     single = not SPK_BASE
     p = argparse.ArgumentParser(
         description="Extract vocal-tract distance (VTD) from SAM2 masks."
@@ -1335,12 +1348,18 @@ def main():
         default=RECENTER_ITERS,
         help="midline medial-recentering iterations.",
     )
+    p.add_argument(
+        "--session",
+        default=SESSION,
+        help="session subdir for longitudinal data ({spk}/{session}/...).",
+    )
     args = p.parse_args()
     UPSCALE, PRE_SIGMA, SIGMA_PATH = args.upscale, args.pre_sigma, args.sigma_path
     EVEN_TOTAL = args.parity == "even"
     GRID_METHOD, NORM_METHOD = args.grid_method, args.norm_method
     ANCHOR_SMOOTH = {"median": args.anchor_median, "sigma": args.anchor_sigma}
     RECENTER_ITERS = args.recenter_iters
+    SESSION = args.session or None
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")
