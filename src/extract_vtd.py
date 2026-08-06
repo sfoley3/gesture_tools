@@ -554,7 +554,9 @@ def _tongue_dorsum(mask_up, jaw_ref_up=None):
     a, b = sorted([idx_j, idx_root])
     path_a = pts[a : b + 1]
     path_b = np.concatenate([pts[b:], pts[: a + 1]])
-    upper = path_a if path_a[:, 1].mean() <= path_b[:, 1].mean() else path_b  # airway side
+    upper = (
+        path_a if path_a[:, 1].mean() <= path_b[:, 1].mean() else path_b
+    )  # airway side
     if upper[0, 0] > upper[-1, 0]:
         upper = upper[::-1]  # front (low x) -> root (high x)
     return upper.astype(np.float32)
@@ -591,9 +593,13 @@ def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
             if aperture is not None:
                 lip_top = lip_top[lip_top[:, 0] >= aperture[0] - 0.5]
                 lip_top = (
-                    np.vstack([aperture[None, :], lip_top]) if len(lip_top) else aperture[None, :]
+                    np.vstack([aperture[None, :], lip_top])
+                    if len(lip_top)
+                    else aperture[None, :]
                 )
-            lip_top = lip_top[lip_top[:, 0] <= dorsum[0, 0] + 0.5]  # anterior of tongue front
+            lip_top = lip_top[
+                lip_top[:, 0] <= dorsum[0, 0] + 0.5
+            ]  # anterior of tongue front
             if len(lip_top):
                 parts.append(lip_top)
                 br = _bridge(lip_top[-1], dorsum[0])  # bridge lip -> tongue front
@@ -601,7 +607,9 @@ def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
                     parts.append(br)
     parts.append(dorsum)
 
-    backside = _tongue_backside(tongue, _wall_bottom_up(reg_up, w_low))  # root -> terminus
+    backside = _tongue_backside(
+        tongue, _wall_bottom_up(reg_up, w_low)
+    )  # root -> terminus
     if backside is not None and len(backside) >= 1:
         parts.append(backside[1:] if len(backside) > 1 else backside)  # drop dup root
 
@@ -1013,7 +1021,9 @@ def _utterance_anchors(regions, T, jaw_ref):
             if wl is not None:
                 w_raw[t] = wl
     if WALL_BOTTOM == "median" and np.isfinite(w_raw).any():
-        wm = np.array([np.nanmedian(w_raw[:, 0]), np.nanmedian(w_raw[:, 1])], np.float32)
+        wm = np.array(
+            [np.nanmedian(w_raw[:, 0]), np.nanmedian(w_raw[:, 1])], np.float32
+        )
         w_low_s = np.tile(wm, (T, 1))
     else:
         w_low_s = stabilize(w_raw, msize, sig)  # (T,2), NaN-filled
@@ -1042,7 +1052,12 @@ def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n):
     """Single-frame VTD for the configured grid method using precomputed anchors."""
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
-    if roof is not None and len(roof) >= 3 and f_vel_t is not None and np.isfinite(f_vel_t):
+    if (
+        roof is not None
+        and len(roof) >= 3
+        and f_vel_t is not None
+        and np.isfinite(f_vel_t)
+    ):
         vc = _point_at_fraction(roof, float(f_vel_t))
     else:
         vc = vel_c
@@ -1265,7 +1280,9 @@ def write_diagnostic_video(
         else:
             canvas = np.full((fh, fw, 3), 20, np.uint8)
         roof, floor, vel_c = walls[t]
-        _, r, f, a_idx = _grid_with_anchors(roof, floor, vel_c, f_vel[t], tb[t], n_gridlines)
+        _, r, f, a_idx = _grid_with_anchors(
+            roof, floor, vel_c, f_vel[t], tb[t], n_gridlines
+        )
         _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
@@ -1424,7 +1441,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     ti = T // 2
     walls_d, f_vel_d, tb_d = _utterance_anchors(regions, T, jaw_ref)
     roof, floor, vel_c = walls_d[ti]
-    _, r, f, a_idx = _grid_with_anchors(roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines)
+    _, r, f, a_idx = _grid_with_anchors(
+        roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines
+    )
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
