@@ -95,7 +95,10 @@ _DEFAULT_CFG = {
     "even_total": False,  # False -> 2n+3 grid lines (odd, default: n=5 -> 13); True -> 2n+2
     "grid_method": "arc",  # {arc, midline}. arc = index-to-index (legacy); midline = normal cross-sections
     "norm_method": "minmax",  # {minmax, zscore} per-speaker per-grid-line normalization
-    "anchor_smooth": {"median": 5, "sigma": 2.5},  # temporal stabilization of velum/tongue-bottom anchors
+    "anchor_smooth": {
+        "median": 5,
+        "sigma": 2.5,
+    },  # temporal stabilization of velum/tongue-bottom anchors
     "recenter_iters": 1,  # midline medial-recentering iterations
     "floor_front": "skyline",  # {skyline, contour} tongue/lip surface tracing for the floor
     "velum_anchor": "median",  # {median, smooth} velum split: per-video median fraction (firm) vs per-frame smoothed
@@ -897,7 +900,9 @@ def build_midline(roof, floor, recenter_iters=1, m=150, sigma=3.0):
     return mid
 
 
-def midline_grid(roof, floor, f_vel, tongue_bottom, n, even_total=False, recenter_iters=1):
+def midline_grid(
+    roof, floor, f_vel, tongue_bottom, n, even_total=False, recenter_iters=1
+):
     """Unified VTD grid for BOTH cavities: L points along a shared midline, each
     VTD measured PERPENDICULAR to the local tract axis (straight, shortest cross-
     section — no angled connectors). The velum split (fraction `f_vel` on the roof)
@@ -938,9 +943,17 @@ def midline_grid(roof, floor, f_vel, tongue_bottom, n, even_total=False, recente
     s_abs = s_vel * cum[-1]
     p_mid = _point_at_fraction(mid, s_vel)
     oral = mid[cum <= s_abs]
-    oral = np.vstack([oral, p_mid[None, :]]) if len(oral) else np.vstack([mid[0][None, :], p_mid[None, :]])
+    oral = (
+        np.vstack([oral, p_mid[None, :]])
+        if len(oral)
+        else np.vstack([mid[0][None, :], p_mid[None, :]])
+    )
     phar = mid[cum >= s_abs]
-    phar = np.vstack([p_mid[None, :], phar]) if len(phar) else np.vstack([p_mid[None, :], mid[-1][None, :]])
+    phar = (
+        np.vstack([p_mid[None, :], phar])
+        if len(phar)
+        else np.vstack([p_mid[None, :], mid[-1][None, :]])
+    )
 
     k_o = n + 2
     k_p = (n + 1) if even_total else (n + 2)
@@ -1271,8 +1284,8 @@ def _discover_speakers():
             d.name
             for d in DATA_DIR.iterdir()
             if d.is_dir()
-            # and d.name.startswith(SPK_BASE)
-            and d.name in ["ID16", "ID17", "ID18", "ID20", "ID21"]
+            and d.name.startswith(SPK_BASE)
+            # and d.name in ["ID16", "ID17", "ID18", "ID20", "ID21"]
             and (d / SESSION / "sam_seg" / "masks").is_dir()
         )
     else:
@@ -1376,7 +1389,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
                 all_nan, 0.0, np.nanmin(np.where(np.isnan(stacked), np.inf, stacked), 0)
             )
             vmax = np.where(
-                all_nan, 1.0, np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), 0)
+                all_nan,
+                1.0,
+                np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), 0),
             )
         rng = np.where((vmax - vmin) > 1e-6, vmax - vmin, 1.0)
         hist_range = (0.0, 1.0)
@@ -1457,7 +1472,7 @@ def main():
         p.add_argument(
             "--spk",
             nargs="+",
-            type=int,
+            type=str,
             default=None,
             metavar="N",
             help=f"Speaker numbers (prefix '{SPK_BASE}'). Default: all.",
