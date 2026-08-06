@@ -113,6 +113,7 @@ _cfg = _load_config()
 DATA_DIR = Path(_cfg["data_dir"])
 N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 5))
 SPK_BASE = _cfg.get("spk_base", "")
+SESSION = _cfg.get("session", "")
 VIDEO_DIR = _cfg.get("video_dir", "video")
 N_GRIDLINES = int(_cfg.get("n_gridlines", 40))
 N_BINS = int(_cfg.get("n_bins", 20))
@@ -838,24 +839,35 @@ def write_diagnostic_video(
 def _discover_speakers():
     if not SPK_BASE:
         return []
-    return sorted(
-        d.name
-        for d in DATA_DIR.iterdir()
-        if d.is_dir()
-        and d.name.startswith(SPK_BASE)
-        and (d / "sam_seg" / "masks").is_dir()
-    )
+    if SESSION is not None:
+        return sorted(
+            d.name
+            for d in DATA_DIR.iterdir()
+            if d.is_dir()
+            # and d.name.startswith(SPK_BASE)
+            and d.name in ["ID16", "ID17", "ID18", "ID20", "ID21"]
+            and (d / SESSION / "sam_seg" / "masks").is_dir()
+        )
+    else:
+        return sorted(
+            d.name
+            for d in DATA_DIR.iterdir()
+            if d.is_dir()
+            and d.name.startswith(SPK_BASE)
+            and (d / "sam_seg" / "masks").is_dir()
+        )
 
 
 def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     base = DATA_DIR / spk if spk is not None else DATA_DIR
     label = spk if spk is not None else DATA_DIR.name
-    mask_dir = base / "sam_seg" / "masks"
-    video_dir = base / VIDEO_DIR
-    out_dir = base / "vtd"
+    session = SESSION if SESSION is not None else ""
+    mask_dir = base / session / "sam_seg" / "masks"
+    video_dir = base / session / VIDEO_DIR
+    out_dir = base / session / "vtd"
 
-    pattern = f"{spk}_*.npz" if spk is not None else "*.npz"
+    pattern = "*.npz"
     mask_files = sorted(mask_dir.glob(pattern))
     # mask_files = mask_files[:2]
     if not mask_files:
