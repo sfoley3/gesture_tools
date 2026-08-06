@@ -22,9 +22,9 @@ them. No lingual origin, no semipolar / Proctor construction — just two lines:
     (tongue UNION lower-lip) from the lips to the tongue root — the tongue
     dorsum wherever the tongue is present (the higher surface), so it never dips
     under the tongue or onto the jaw and never misses the tongue -> tongue
-    posterior/backside edge from the root down, cut off at the backside point
-    closest to the lowest point of the pharyngeal wall (so it does not curl too
-    far under the tongue).
+    posterior/backside edge from the root down to the tongue point closest to the
+    lowest point of the pharyngeal wall (its inferior-posterior corner, the
+    posterior terminus).
 
 VTD grid: THREE anchors — the lips, the center of the velum's lower edge, and
 the tongue back — split each wall into an oral cavity (lips->velum) and a
@@ -97,6 +97,9 @@ _DEFAULT_CFG = {
     "norm_method": "minmax",  # {minmax, zscore} per-speaker per-grid-line normalization
     "anchor_smooth": {"median": 5, "sigma": 2.5},  # temporal stabilization of velum/tongue-bottom anchors
     "recenter_iters": 1,  # midline medial-recentering iterations
+    "floor_front": "skyline",  # {skyline, contour} tongue/lip surface tracing for the floor
+    "velum_anchor": "median",  # {median, smooth} velum split: per-video median fraction (firm) vs per-frame smoothed
+    "wall_bottom": "median",  # {median, smooth} pharyngeal-wall bottom (tongue-back terminus ref): firm vs smoothed
     "session": None,  # session subdir for longitudinal data ({spk}/{session}/...); None = flat
 }
 
@@ -130,6 +133,9 @@ GRID_METHOD = str(_cfg.get("grid_method", "arc"))
 NORM_METHOD = str(_cfg.get("norm_method", "minmax"))
 ANCHOR_SMOOTH = dict(_cfg.get("anchor_smooth", {"median": 5, "sigma": 2.5}))
 RECENTER_ITERS = int(_cfg.get("recenter_iters", 1))
+FLOOR_FRONT = str(_cfg.get("floor_front", "skyline"))
+VELUM_ANCHOR = str(_cfg.get("velum_anchor", "median"))
+WALL_BOTTOM = str(_cfg.get("wall_bottom", "median"))
 MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
@@ -455,10 +461,43 @@ def build_roof(reg_up: dict):
     return _smooth_path(line, SIGMA_PATH)
 
 
-def _tongue_backside(tongue_mask):
+def _wall_bottom_pixel(mask):
+    """Lowest pixel (max y) of the largest component of a wall mask, or None.
+    Operates in the mask's own coords (used on raw masks for the stabilization
+    pre-pass)."""
+    if mask is None:
+        return None
+    core = _largest_component(np.asarray(mask).astype(bool))
+    if not core.any():
+        return None
+    wy, wx = np.where(core)
+    i = int(wy.argmax())
+    return np.array([float(wx[i]), float(wy[i])], np.float32)
+
+
+def _wall_bottom_up(reg_up, w_low=None):
+    """Pharyngeal-wall bottom in UPSCALED coords for `_tongue_backside`. Uses the
+    provided (stabilized, original-coord) `w_low` scaled up when finite; otherwise
+    falls back to this frame's lowest wall pixel from `reg_up`."""
+    if w_low is not None and np.all(np.isfinite(w_low)):
+        return np.asarray(w_low, np.float32) * UPSCALE
+    wall = reg_up.get(PHARYNX_SUB)
+    if wall is None or not np.asarray(wall).any():
+        return None
+    wy, wx = np.where(wall)
+    i = int(wy.argmax())
+    return np.array([float(wx[i]), float(wy[i])], np.float32)
+
+
+def _tongue_backside(tongue_mask, w_low=None):
     """Posterior/backside edge of the tongue: the contour arc from the right-most
-    point (root) to the bottom-most point, taken on the higher-x (airway/wall-
-    facing) side, oriented root(top) -> bottom. Returns (K,2) upscaled or None."""
+    point (root) to the tongue-contour point CLOSEST to the pharyngeal-wall bottom
+    `w_low` (the tongue's inferior-posterior corner). Terminating at that point —
+    rather than the tongue's own geometric max-y — is what lets the backside reach
+    the true bottom instead of being cut short: the descent past the wall-facing
+    corner curls to lower x, so an x-based cut deletes it. Falls back to the
+    bottom-most pixel when `w_low` is None. Taken on the higher-x (wall-facing)
+    side, oriented root -> terminus. Returns (K,2) upscaled or None."""
     core = _largest_component(tongue_mask.astype(bool)).astype(np.uint8)
     cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cs:
@@ -467,19 +506,107 @@ def _tongue_backside(tongue_mask):
     if pts.ndim != 2 or len(pts) < 4:
         return None
     root = int(pts[:, 0].argmax())  # right-most (tongue root)
-    bottom = int(pts[:, 1].argmax())  # bottom-most
-    if root == bottom:
+    if w_low is not None:
+        end = int(((pts - np.asarray(w_low, np.float32)[None, :]) ** 2).sum(1).argmin())
+    else:
+        end = int(pts[:, 1].argmax())  # fallback: bottom-most pixel
+    if root == end:
         return None
-    a, b = sorted([root, bottom])
+    a, b = sorted([root, end])
     arc1 = pts[a : b + 1]
     arc2 = np.concatenate([pts[b:], pts[: a + 1]])
     arc = arc1 if arc1[:, 0].mean() >= arc2[:, 0].mean() else arc2  # posterior side
-    if arc[0, 1] > arc[-1, 1]:  # orient top (root) -> bottom
+    # Orient root -> terminus (robust to the terminus being above or below root).
+    if ((arc[0] - pts[root]) ** 2).sum() > ((arc[-1] - pts[root]) ** 2).sum():
         arc = arc[::-1]
     return arc.astype(np.float32)
 
 
-def build_floor(reg_up: dict, jaw_ref_up=None):
+def _tongue_dorsum(mask_up, jaw_ref_up=None):
+    """Airway-facing tongue surface (dorsum) from the mask CONTOUR: the upper arc
+    between the jaw-junction (anterior underside anchor) and the tongue root
+    (right-most). Unlike the per-column skyline (`_top_edge`), this follows the
+    ACTUAL mask edge, so it stays on the surface where the tongue is steep or bent
+    (e.g. toward the back) instead of flattening it to one height per column.
+    Returns (M,2) front -> root, or None. (Same upper-arc logic as
+    `extract_upper_contour` but without the backside walk — the backside is traced
+    separately by `_tongue_backside` to the pharyngeal-wall terminus.)"""
+    if mask_up is None or not mask_up.any():
+        return None
+    core = _largest_component(mask_up.astype(bool)).astype(np.uint8)
+    cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cs:
+        return None
+    pts = max(cs, key=len).squeeze()
+    if pts.ndim != 2 or len(pts) < 4:
+        return None
+    idx_root = int(pts[:, 0].argmax())  # right-most = tongue root
+    if jaw_ref_up is not None:
+        rx, ry = jaw_ref_up
+        idx_j = int(((pts[:, 0] - rx) ** 2 + (pts[:, 1] - ry) ** 2).argmin())
+    else:
+        idx_j = int(pts[:, 0].argmin())  # left-most = tongue front
+    if idx_j == idx_root:
+        return None
+    a, b = sorted([idx_j, idx_root])
+    path_a = pts[a : b + 1]
+    path_b = np.concatenate([pts[b:], pts[: a + 1]])
+    upper = path_a if path_a[:, 1].mean() <= path_b[:, 1].mean() else path_b  # airway side
+    if upper[0, 0] > upper[-1, 0]:
+        upper = upper[::-1]  # front (low x) -> root (high x)
+    return upper.astype(np.float32)
+
+
+def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
+    """Floor traced from the actual mask CONTOURS, per region (no lip/tongue union
+    skyline). lip aperture -> lower-lip top -> bridge -> tongue dorsum (contour) ->
+    tongue backside (contour) to the pharyngeal terminus. Each segment follows its
+    own region's real edge, so there is no lip/tongue skyline hop and steep/bent
+    tongue surfaces are preserved. Returns (M,2) or None (caller falls back to the
+    skyline path)."""
+    tongue = reg_up.get(TONGUE_SUB)
+    if tongue is None or not tongue.any():
+        return None
+    dorsum = _tongue_dorsum(tongue, jaw_ref_up)
+    if dorsum is None:
+        dorsum = _top_edge(tongue)  # fall back to skyline for the dorsum only
+        if dorsum is None or len(dorsum) < 2:
+            return None
+
+    parts = []
+    lower = reg_up.get(LOWER_LIP_SUB)
+    upper_lip = reg_up.get(ROOF_FRONT_SUB)
+    if lower is not None and lower.any():
+        lip_top = _top_edge(lower)  # lower lip's OWN airway-facing top (not unioned)
+        if len(lip_top):
+            aperture = None
+            if upper_lip is not None and upper_lip.any():
+                ub = _bottom_edge(upper_lip)
+                if len(ub):
+                    d, _idx = cKDTree(ub).query(lip_top)
+                    aperture = lip_top[int(d.argmin())]  # lip aperture (closest pair)
+            if aperture is not None:
+                lip_top = lip_top[lip_top[:, 0] >= aperture[0] - 0.5]
+                lip_top = (
+                    np.vstack([aperture[None, :], lip_top]) if len(lip_top) else aperture[None, :]
+                )
+            lip_top = lip_top[lip_top[:, 0] <= dorsum[0, 0] + 0.5]  # anterior of tongue front
+            if len(lip_top):
+                parts.append(lip_top)
+                br = _bridge(lip_top[-1], dorsum[0])  # bridge lip -> tongue front
+                if len(br):
+                    parts.append(br)
+    parts.append(dorsum)
+
+    backside = _tongue_backside(tongue, _wall_bottom_up(reg_up, w_low))  # root -> terminus
+    if backside is not None and len(backside) >= 1:
+        parts.append(backside[1:] if len(backside) > 1 else backside)  # drop dup root
+
+    line = np.concatenate(parts, axis=0) / UPSCALE
+    return _smooth_path(line, SIGMA_PATH)
+
+
+def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None):
     """One line, front -> back, in original coords: a single airway-facing upper
     edge from the lip through the tongue, then down the tongue backside.
 
@@ -488,7 +615,16 @@ def build_floor(reg_up: dict, jaw_ref_up=None):
     present and the tongue dorsum wherever the tongue is present (the tongue is
     the higher surface), so it can never dip under the tongue or onto the jaw
     below it, and never misses the tongue. Back edge = the tongue posterior edge
-    from the root down to the bottom. Returns (M,2) or None."""
+    from the root down to the bottom. Returns (M,2) or None.
+
+    When `floor_front == "contour"`, the front is instead traced from the actual
+    mask contours per region (`_build_floor_contour`), which follows steep/bent
+    tongue surfaces the skyline flattens; falls back to this skyline path if the
+    contour trace fails."""
+    if FLOOR_FRONT == "contour":
+        _line = _build_floor_contour(reg_up, jaw_ref_up, w_low)
+        if _line is not None:
+            return _line
     U = UPSCALE
     tongue = reg_up.get(TONGUE_SUB)
     if tongue is None or not tongue.any():
@@ -517,23 +653,13 @@ def build_floor(reg_up: dict, jaw_ref_up=None):
             front = np.vstack([aperture[None, :], front])
     parts = [front]
 
-    backside = _tongue_backside(tongue)  # root -> bottom (posterior)
-    if backside is not None and len(backside) > 1:
-        # Limit how far the backside descends/curls under: find the backside point
-        # closest to the LOWEST point of the pharyngeal wall, and cut any backside
-        # points left (anterior) of it. This point is only a cutoff — it is not
-        # added as an endpoint.
-        wall = reg_up.get(PHARYNX_SUB)
-        if wall is not None and wall.any():
-            wy, wx = np.where(wall)
-            i_low = int(wy.argmax())  # lowest wall pixel (max y)
-            w_low = np.array([float(wx[i_low]), float(wy[i_low])], np.float32)
-            cut_x = float(
-                backside[((backside - w_low[None, :]) ** 2).sum(1).argmin(), 0]
-            )
-            backside = backside[backside[:, 0] >= cut_x - 0.5]
-        if len(backside) >= 1:
-            parts.append(backside)
+    # Tongue backside: trace from the root all the way to the tongue-contour point
+    # closest to the pharyngeal-wall bottom (its inferior-posterior corner), so it
+    # reaches the true bottom instead of being cut short. That terminus is also the
+    # posterior VTD anchor, keeping the tongue-back and rear-wall endpoints aligned.
+    backside = _tongue_backside(tongue, _wall_bottom_up(reg_up, w_low))
+    if backside is not None and len(backside) >= 1:
+        parts.append(backside)
 
     line = np.concatenate(parts, axis=0) / U
     return _smooth_path(line, SIGMA_PATH)
@@ -846,17 +972,68 @@ def midline_grid(roof, floor, f_vel, tongue_bottom, n, even_total=False, recente
     return vtd, roof_pts, floor_pts, a_idx
 
 
-def _grid_for_frame(roof, floor, vel_c, reg_up, n):
-    """Single-frame dispatch to the configured grid method (per-frame anchors, no
-    temporal smoothing). Used by the diagnostics so overlays match the method."""
-    if GRID_METHOD == "midline":
+def _utterance_anchors(regions, T, jaw_ref):
+    """Trace walls for every frame of one utterance and derive the velum split
+    fraction and tongue-bottom anchor, honoring VELUM_ANCHOR / ANCHOR_SMOOTH.
+
+    Returns (walls, f_vel, tb): walls[t] = (roof, floor, vel_c); f_vel (T,) is the
+    velum split as a roof-arc fraction; tb (T,2) the tongue-bottom point.
+
+    VELUM_ANCHOR == "median" gives ONE firm split fraction for the whole clip — the
+    median of the per-frame roof-arc fractions. Because the fraction is measured
+    relative to the palate/roof, it is invariant to gross head TRANSLATION (the
+    velum and roof shift together), so a fixed median needs no separate head-motion
+    correction. "smooth" keeps the per-frame trajectory, temporally de-jittered.
+
+    The pharyngeal-wall bottom (tongue-back terminus reference) is likewise
+    stabilized per WALL_BOTTOM ("median" = one firm point per clip) so the terminus
+    stops chasing wall-mask fraying."""
+    msize = int(ANCHOR_SMOOTH.get("median", 1))
+    sig = float(ANCHOR_SMOOTH.get("sigma", 0.0))
+
+    # Pre-pass: stabilized pharyngeal-wall bottom, from the raw wall masks.
+    w_raw = np.full((T, 2), np.nan, np.float32)
+    wall_masks = regions.get(PHARYNX_SUB)
+    if wall_masks is not None:
+        for t in range(min(T, wall_masks.shape[0])):
+            wl = _wall_bottom_pixel(wall_masks[t])
+            if wl is not None:
+                w_raw[t] = wl
+    if WALL_BOTTOM == "median" and np.isfinite(w_raw).any():
+        wm = np.array([np.nanmedian(w_raw[:, 0]), np.nanmedian(w_raw[:, 1])], np.float32)
+        w_low_s = np.tile(wm, (T, 1))
+    else:
+        w_low_s = stabilize(w_raw, msize, sig)  # (T,2), NaN-filled
+
+    walls = []
+    f_raw = np.full(T, np.nan, np.float32)
+    tb_raw = np.full((T, 2), np.nan, np.float32)
+    for t in range(T):
+        roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
+        walls.append((roof, floor, vel_c))
         vcent = _velum_centroid(reg_up)
-        f_vel = None
         if roof is not None and vcent is not None and len(roof) >= 3:
-            _, f_vel, _ = _project_to_polyline(roof, vcent)
-        tb = floor[-1] if (floor is not None and len(floor) >= 2) else None
-        return midline_grid(roof, floor, f_vel, tb, n, EVEN_TOTAL, RECENTER_ITERS)
-    return compute_vtd(roof, floor, vel_c, n, EVEN_TOTAL)
+            _, f_raw[t], _ = _project_to_polyline(roof, vcent)
+        if floor is not None and len(floor) >= 2:
+            tb_raw[t] = floor[-1]
+    if VELUM_ANCHOR == "median":
+        fm = float(np.nanmedian(f_raw)) if np.isfinite(f_raw).any() else np.nan
+        f_vel = np.full(T, fm, np.float64)
+    else:  # "smooth"
+        f_vel = stabilize(f_raw, msize, sig)
+    tb = stabilize(tb_raw, msize, sig)
+    return walls, f_vel, tb
+
+
+def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n):
+    """Single-frame VTD for the configured grid method using precomputed anchors."""
+    if GRID_METHOD == "midline":
+        return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
+    if roof is not None and len(roof) >= 3 and f_vel_t is not None and np.isfinite(f_vel_t):
+        vc = _point_at_fraction(roof, float(f_vel_t))
+    else:
+        vc = vel_c
+    return compute_vtd(roof, floor, vc, n, EVEN_TOTAL)
 
 
 # ── NPZ / frame helpers ──────────────────────────────────────────────────────
@@ -883,16 +1060,18 @@ def _velum_lower_center(reg_up):
     return None if c is None else (c / UPSCALE)
 
 
-def _frame_walls(regions, t, jaw_ref):
+def _frame_walls(regions, t, jaw_ref, w_low=None):
     """Smooth-upscale each region at frame t, then trace roof & floor and locate
-    the velum lower-edge center. Returns (roof, floor, velum_center, reg_up)."""
+    the velum lower-edge center. `w_low` (stabilized pharyngeal-wall bottom, original
+    coords) is threaded to the floor's tongue-back terminus. Returns
+    (roof, floor, velum_center, reg_up)."""
     reg_up = {}
     for sub, m in regions.items():
         reg_up[sub] = smooth_mask(m[t]) if (m is not None and t < m.shape[0]) else None
     jaw_up = (jaw_ref[0] * UPSCALE, jaw_ref[1] * UPSCALE) if jaw_ref else None
     return (
         build_roof(reg_up),
-        build_floor(reg_up, jaw_up),
+        build_floor(reg_up, jaw_up, w_low=w_low),
         _velum_lower_center(reg_up),
         reg_up,
     )
@@ -1060,6 +1239,8 @@ def write_diagnostic_video(
     writer = cv2.VideoWriter(
         str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh)
     )
+    # Same anchors as the output (e.g. one firm median velum split for the clip).
+    walls, f_vel, tb = _utterance_anchors(regions, T, jaw_ref)
     for t in range(T):
         mri = _mri_frame(cap, t, (mh, mw)) if cap is not None else None
         if mri is not None:
@@ -1070,8 +1251,8 @@ def write_diagnostic_video(
             )
         else:
             canvas = np.full((fh, fw, 3), 20, np.uint8)
-        roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref)
-        _, r, f, a_idx = _grid_for_frame(roof, floor, vel_c, reg_up, n_gridlines)
+        roof, floor, vel_c = walls[t]
+        _, r, f, a_idx = _grid_with_anchors(roof, floor, vel_c, f_vel[t], tb[t], n_gridlines)
         _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
@@ -1136,6 +1317,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
                 "norm_method": NORM_METHOD,
                 "anchor_smooth": ANCHOR_SMOOTH,
                 "recenter_iters": RECENTER_ITERS,
+                "floor_front": FLOOR_FRONT,
+                "velum_anchor": VELUM_ANCHOR,
+                "wall_bottom": WALL_BOTTOM,
             },
             fh,
             indent=2,
@@ -1143,9 +1327,6 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     per_video = {}  # basename -> (mask_path, video_path, T)
     all_vtd = []
-    msize = int(ANCHOR_SMOOTH.get("median", 1))
-    sig = float(ANCHOR_SMOOTH.get("sigma", 0.0))
-    smooth_on = (sig > 0) or (msize > 1)
     for mp in tqdm(mask_files, desc=f"  {label} VTD"):
         basename = mp.stem
         regions, T = _load_regions(mp)
@@ -1156,40 +1337,18 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
             if regions[TONGUE_SUB] is not None and regions[LOWER_LIP_SUB] is not None
             else None
         )
-        # Pass 1: trace walls + measure raw anchors (velum centroid fraction on the
-        # roof; tongue-bottom = posterior-most floor point). Cache walls for pass 2.
-        walls = []
-        f_vel_raw = np.full(T, np.nan, np.float32)
-        tb_raw = np.full((T, 2), np.nan, np.float32)
-        for t in range(T):
-            roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref)
-            walls.append((roof, floor, vel_c))
-            vcent = _velum_centroid(reg_up)
-            if roof is not None and vcent is not None and len(roof) >= 3:
-                _, f_vel_raw[t], _ = _project_to_polyline(roof, vcent)
-            if floor is not None and len(floor) >= 2:
-                tb_raw[t] = floor[-1]
-        # Temporally stabilize the anchors (no-op fill when smoothing disabled).
-        f_vel = stabilize(f_vel_raw, msize, sig)
-        tb = stabilize(tb_raw, msize, sig)
+        # Pass 1: trace walls + derive the velum split fraction and tongue-bottom,
+        # per VELUM_ANCHOR (median = one firm fraction per clip) / ANCHOR_SMOOTH.
+        walls, f_vel, tb = _utterance_anchors(regions, T, jaw_ref)
         # Pass 2: compute VTD with the stabilized anchors.
         vtd = np.full((T, L), np.nan, np.float32)
         roof_pts = np.full((T, L, 2), np.nan, np.float32)
         floor_pts = np.full((T, L, 2), np.nan, np.float32)
         for t in range(T):
             roof, floor, vel_c = walls[t]
-            if GRID_METHOD == "midline":
-                v, r, f, _ = midline_grid(
-                    roof, floor, f_vel[t], tb[t], n_gridlines, EVEN_TOTAL, RECENTER_ITERS
-                )
-            else:
-                # arc: use the stabilized velum split when smoothing is on, else the
-                # legacy per-frame velum center (byte-for-byte backward compatible).
-                if smooth_on and roof is not None and len(roof) >= 3 and np.isfinite(f_vel[t]):
-                    vc = _point_at_fraction(roof, float(f_vel[t]))
-                else:
-                    vc = vel_c
-                v, r, f, _ = compute_vtd(roof, floor, vc, n_gridlines, EVEN_TOTAL)
+            v, r, f, _ = _grid_with_anchors(
+                roof, floor, vel_c, f_vel[t], tb[t], n_gridlines
+            )
             vtd[t], roof_pts[t], floor_pts[t] = v, r, f
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
         np.savez(out_dir / "lines" / f"{basename}.npz", roof=roof_pts, floor=floor_pts)
@@ -1248,8 +1407,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         else None
     )
     ti = T // 2
-    roof, floor, vel_c, reg_up = _frame_walls(regions, ti, jaw_ref)
-    _, r, f, a_idx = _grid_for_frame(roof, floor, vel_c, reg_up, n_gridlines)
+    walls_d, f_vel_d, tb_d = _utterance_anchors(regions, T, jaw_ref)
+    roof, floor, vel_c = walls_d[ti]
+    _, r, f, a_idx = _grid_with_anchors(roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines)
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
@@ -1287,7 +1447,8 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
 def main():
     global UPSCALE, PRE_SIGMA, SIGMA_PATH, EVEN_TOTAL
-    global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS, SESSION
+    global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS, SESSION, FLOOR_FRONT
+    global VELUM_ANCHOR, WALL_BOTTOM
     single = not SPK_BASE
     p = argparse.ArgumentParser(
         description="Extract vocal-tract distance (VTD) from SAM2 masks."
@@ -1353,6 +1514,24 @@ def main():
         default=SESSION,
         help="session subdir for longitudinal data ({spk}/{session}/...).",
     )
+    p.add_argument(
+        "--floor-front",
+        choices=["skyline", "contour"],
+        default=FLOOR_FRONT,
+        help="skyline = per-column union top edge (legacy); contour = per-region mask-edge trace.",
+    )
+    p.add_argument(
+        "--velum-anchor",
+        choices=["median", "smooth"],
+        default=VELUM_ANCHOR,
+        help="median = one firm per-video split fraction; smooth = per-frame smoothed.",
+    )
+    p.add_argument(
+        "--wall-bottom",
+        choices=["median", "smooth"],
+        default=WALL_BOTTOM,
+        help="pharyngeal-wall bottom (tongue-back terminus ref): median (firm) vs smoothed.",
+    )
     args = p.parse_args()
     UPSCALE, PRE_SIGMA, SIGMA_PATH = args.upscale, args.pre_sigma, args.sigma_path
     EVEN_TOTAL = args.parity == "even"
@@ -1360,6 +1539,9 @@ def main():
     ANCHOR_SMOOTH = {"median": args.anchor_median, "sigma": args.anchor_sigma}
     RECENTER_ITERS = args.recenter_iters
     SESSION = args.session or None
+    FLOOR_FRONT = args.floor_front
+    VELUM_ANCHOR = args.velum_anchor
+    WALL_BOTTOM = args.wall_bottom
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")

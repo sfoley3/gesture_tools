@@ -79,8 +79,10 @@ def _plot(basename, f_edge, f_cent, f_smooth, tbx, tbx_s, tby, tby_s, out_path):
     ax.plot(fr, f_edge, color="0.75", lw=1.0, label="bottom-edge (old)")
     ax.plot(fr, f_cent, color="tab:orange", lw=1.0, alpha=0.8, label="centroid (raw)")
     ax.plot(fr, f_smooth, color="tab:blue", lw=2.2, label="centroid + smoothed")
+    f_median = np.nanmedian(f_cent)
+    ax.axhline(f_median, color="tab:red", lw=2.0, ls="--", label=f"median (firm)={f_median:.3f}")
     ax.set_ylabel("velum split\n(roof arc frac)")
-    ax.legend(loc="upper right", fontsize=8, ncol=3)
+    ax.legend(loc="upper right", fontsize=8, ncol=2)
     ax.set_title(basename)
 
     for ax, raw, sm, lab in (
