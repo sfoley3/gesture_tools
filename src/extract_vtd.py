@@ -983,11 +983,23 @@ def midline_grid(
         nrm /= ln
         roof_pts[i], floor_pts[i] = _straddle_hits(G[i], nrm, R, F)
 
-    # Pin the two end anchors explicitly (req 3 for the posterior line).
     roof_pts[0], floor_pts[0] = R[0], F[0]
     if tb is not None:
-        floor_pts[-1] = tb
-        roof_pts[-1] = _nearest_on(R, tb)
+        # Posterior cavity: evenly space the tongue points along the FLOOR from the
+        # velum split down to the tongue-bottom terminus, so the last point (tb) is
+        # a natural, evenly-spaced endpoint rather than an override that leaves a gap
+        # before it. Each connects straight to the nearest rear-wall point (shortest
+        # cross-distance), and the terminus is tb -> closest wall point.
+        v_idx = a_idx[1]
+        j0 = int(((F - floor_pts[v_idx][None, :]) ** 2).sum(1).argmin())
+        ev_pts = _resample(F[j0:], L - v_idx)  # split..tb, evenly spaced, tb last
+        if ev_pts is not None and len(ev_pts) == L - v_idx:
+            floor_pts[v_idx:] = ev_pts
+            for i in range(v_idx, L):
+                roof_pts[i] = _nearest_on(R, floor_pts[i])
+        else:
+            floor_pts[-1] = tb
+            roof_pts[-1] = _nearest_on(R, tb)
 
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
@@ -1150,6 +1162,18 @@ def _mri_frame(cap, t, mask_hw):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
+def _trim_roof_to_last(roof, r):
+    """Trim the drawn roof/rear-wall polyline at the last VTD connection point
+    (r[-1]) so it does not extend below where the last tongue point connects."""
+    if roof is None or r is None or len(r) == 0 or len(roof) < 2:
+        return roof
+    last = np.asarray(r[-1], np.float32)
+    if not np.all(np.isfinite(last)):
+        return roof
+    idx = int(((np.asarray(roof, np.float32) - last[None, :]) ** 2).sum(1).argmin())
+    return roof[: idx + 1] if idx >= 1 else roof
+
+
 def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=()):
     """Draw masks (translucent), wall lines and VTD grid+points onto a BGR
     canvas whose size is (mask * scale). Coordinates are in mask space. Anchor
@@ -1188,7 +1212,7 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=(
             )
             cv2.circle(canvas, p1, 3, _VTD_BGR, -1)
             cv2.circle(canvas, p2, 3, _VTD_BGR, -1)
-    _poly(roof, _ROOF_BGR)
+    _poly(_trim_roof_to_last(roof, r), _ROOF_BGR)
     _poly(floor, _FLOOR_BGR)
     return canvas
 
@@ -1241,7 +1265,8 @@ def save_static_diagnostic(
                 [u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5, linewidths=0
             )
     if roof is not None:
-        ax.plot(roof[:, 0], roof[:, 1], color="lime", lw=1.8, zorder=4)
+        roof_draw = _trim_roof_to_last(roof, r)
+        ax.plot(roof_draw[:, 0], roof_draw[:, 1], color="lime", lw=1.8, zorder=4)
     if floor is not None:
         ax.plot(floor[:, 0], floor[:, 1], color="red", lw=1.8, zorder=4)
     ax.set_aspect("equal")
