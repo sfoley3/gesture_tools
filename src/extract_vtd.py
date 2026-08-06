@@ -76,7 +76,7 @@ matplotlib.use("Agg")
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import gaussian_filter, gaussian_filter1d, label
+from scipy.ndimage import gaussian_filter, gaussian_filter1d, label, median_filter
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -93,6 +93,10 @@ _DEFAULT_CFG = {
     "pre_sigma": 1.5,
     "sigma_path": 2.0,  # Gaussian smoothing of the derived line (pixels)
     "even_total": False,  # False -> 2n+3 grid lines (odd, default: n=5 -> 13); True -> 2n+2
+    "grid_method": "arc",  # {arc, midline}. arc = index-to-index (legacy); midline = normal cross-sections
+    "norm_method": "minmax",  # {minmax, zscore} per-speaker per-grid-line normalization
+    "anchor_smooth": {"median": 5, "sigma": 2.5},  # temporal stabilization of velum/tongue-bottom anchors
+    "recenter_iters": 1,  # midline medial-recentering iterations
 }
 
 
@@ -120,6 +124,10 @@ UPSCALE = int(_cfg.get("upscale", 1))
 PRE_SIGMA = float(_cfg.get("pre_sigma", 1.5))
 SIGMA_PATH = float(_cfg.get("sigma_path", 2.0))
 EVEN_TOTAL = bool(_cfg.get("even_total", False))
+GRID_METHOD = str(_cfg.get("grid_method", "arc"))
+NORM_METHOD = str(_cfg.get("norm_method", "minmax"))
+ANCHOR_SMOOTH = dict(_cfg.get("anchor_smooth", {"median": 5, "sigma": 2.5}))
+RECENTER_ITERS = int(_cfg.get("recenter_iters", 1))
 MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
@@ -612,6 +620,243 @@ def compute_vtd(roof, floor, velum_center, n, even_total=False):
     return vtd, u, l, a_idx
 
 
+# ── Anchor + polyline geometry (midline method) ──────────────────────────────
+
+
+def _velum_centroid(reg_up):
+    """Velum anchor from the mask CENTROID (not the noisy airway edge). Centroid
+    of the right half (x >= W//2, the posterior/tip side) of the largest velum
+    component — same landmark as `compute_velum_kinematics` in
+    extract_mask_kinematics.py. Averaging over every pixel makes it far more
+    stable than `_velum_lower_center`. Returned in original coords."""
+    vel = reg_up.get(VELUM_SUB)
+    if vel is None or not np.asarray(vel).any():
+        return None
+    core = _largest_component(np.asarray(vel).astype(bool))
+    ys, xs = np.where(core)
+    if len(xs) == 0:
+        return None
+    mid_x = core.shape[1] // 2
+    right = xs >= mid_x
+    if not right.any():
+        right = np.ones_like(xs, dtype=bool)
+    c = np.array([xs[right].mean(), ys[right].mean()], np.float32)
+    return c / UPSCALE
+
+
+def _cumarc(poly):
+    """Cumulative arc length along an (M,2) polyline; cum[-1] = total length."""
+    seg = np.sqrt((np.diff(poly, axis=0) ** 2).sum(1))
+    return np.concatenate([[0.0], np.cumsum(seg)])
+
+
+def _point_at_fraction(poly, frac):
+    """Point at arc-length fraction `frac` in [0,1] along an (M,2) polyline."""
+    poly = np.asarray(poly, np.float32)
+    cum = _cumarc(poly)
+    total = cum[-1]
+    if total <= 0:
+        return poly[0].astype(np.float32)
+    s = float(np.clip(frac, 0.0, 1.0)) * total
+    return np.array(
+        [np.interp(s, cum, poly[:, 0]), np.interp(s, cum, poly[:, 1])], np.float32
+    )
+
+
+def _project_to_polyline(poly, point):
+    """Nearest vertex on `poly` to `point`: returns (index, arc-length fraction,
+    vertex)."""
+    poly = np.asarray(poly, np.float32)
+    i = int(((poly - np.asarray(point, np.float32)[None, :]) ** 2).sum(1).argmin())
+    cum = _cumarc(poly)
+    frac = float(cum[i] / cum[-1]) if cum[-1] > 0 else 0.5
+    return i, frac, poly[i]
+
+
+def _nearest_on(poly, point):
+    """Nearest polyline vertex to `point` (fallback when a normal misses a wall)."""
+    poly = np.asarray(poly, np.float32)
+    i = int(((poly - np.asarray(point, np.float32)[None, :]) ** 2).sum(1).argmin())
+    return poly[i].astype(np.float32)
+
+
+def stabilize(arr, median_size=5, sigma=2.5):
+    """Temporally de-jitter an anchor trajectory: interpolate NaN (dropout)
+    frames, median-filter out isolated bad frames, then Gaussian low-pass the
+    residual jitter. Accepts (T,) or (T,2); a no-op smoothing (median<=1, sigma<=0)
+    still fills NaNs. Slow real motion survives; frame-rate segmentation noise dies."""
+    arr = np.asarray(arr, np.float64)
+    two_d = arr.ndim == 2
+    cols = arr if two_d else arr[:, None]
+    T = cols.shape[0]
+    idx = np.arange(T)
+    out = np.empty_like(cols)
+    for c in range(cols.shape[1]):
+        x = cols[:, c]
+        ok = np.isfinite(x)
+        if ok.sum() == 0:
+            out[:, c] = x
+            continue
+        x = np.interp(idx, idx[ok], x[ok])
+        if median_size and median_size > 1:
+            x = median_filter(x, size=int(median_size))
+        if sigma and sigma > 0:
+            x = gaussian_filter1d(x, sigma=float(sigma))
+        out[:, c] = x
+    return out if two_d else out[:, 0]
+
+
+def _line_crossings(origin, ndir, poly):
+    """All signed intersections of the infinite line (origin + t*ndir) with an
+    (M,2) polyline, sorted by |t| (t is signed distance since |ndir|=1). Returns
+    (ts, pts) or (None, None). Vectorized over segments."""
+    poly = np.asarray(poly, np.float64)
+    o = np.asarray(origin, np.float64)
+    d = np.asarray(ndir, np.float64)
+    a = poly[:-1]
+    e = poly[1:] - poly[:-1]  # (S,2)
+    det = d[1] * e[:, 0] - d[0] * e[:, 1]
+    rhs = a - o[None, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (-rhs[:, 0] * e[:, 1] + e[:, 0] * rhs[:, 1]) / det
+        u = (d[0] * rhs[:, 1] - d[1] * rhs[:, 0]) / det
+    valid = (np.abs(det) > 1e-9) & (u >= -1e-6) & (u <= 1 + 1e-6)
+    if not valid.any():
+        return None, None
+    ts = t[valid]
+    pts = (a[valid] + u[valid, None] * e[valid]).astype(np.float32)
+    order = np.argsort(np.abs(ts))
+    return ts[order], pts[order]
+
+
+def _straddle_hits(origin, nrm, R, F):
+    """Roof/floor hits of the normal line that STRADDLE the midline point: the
+    nearest roof crossing, then the nearest floor crossing on the OPPOSITE side.
+    This yields one clean straight cross-section per station and avoids the
+    degenerate concave-corner case where both nearest hits land on the same side
+    (which would report a spuriously tiny width). Falls back to nearest wall point
+    when the normal misses."""
+    tr, pr = _line_crossings(origin, nrm, R)
+    tf, pf = _line_crossings(origin, nrm, F)
+    rp = pr[0] if pr is not None else _nearest_on(R, origin)
+    t_roof = tr[0] if tr is not None else 0.0
+    if pf is None:
+        fp = _nearest_on(F, origin)
+    elif pr is not None:
+        opp = np.where(np.sign(tf) != np.sign(t_roof))[0]
+        j = opp[np.abs(tf[opp]).argmin()] if len(opp) else 0
+        fp = pf[j]
+    else:
+        fp = pf[0]
+    return rp.astype(np.float32), fp.astype(np.float32)
+
+
+def build_midline(roof, floor, recenter_iters=1, m=150, sigma=3.0):
+    """Smooth centerline between the two walls, lips -> posterior terminus. A
+    coarse arc-length average is medial-recentered (nearest point on each wall,
+    averaged) and smoothed; the final VTD measurement is normal to this line, so
+    the midline only has to be approximately central."""
+    ru = _resample(np.asarray(roof, np.float32), m)
+    fl = _resample(np.asarray(floor, np.float32), m)
+    if ru is None or fl is None:
+        return None
+    mid = _smooth_path(((ru + fl) / 2.0).astype(np.float32), sigma)
+    for _ in range(max(0, int(recenter_iters))):
+        new = np.empty_like(mid)
+        for i in range(len(mid)):
+            new[i] = (_nearest_on(roof, mid[i]) + _nearest_on(floor, mid[i])) / 2.0
+        mid = _smooth_path(new, sigma)
+    return mid
+
+
+def midline_grid(roof, floor, f_vel, tongue_bottom, n, even_total=False, recenter_iters=1):
+    """Unified VTD grid for BOTH cavities: L points along a shared midline, each
+    VTD measured PERPENDICULAR to the local tract axis (straight, shortest cross-
+    section — no angled connectors). The velum split (fraction `f_vel` on the roof)
+    only pins the middle index; the rear wall is clipped at its nearest point to
+    the (smoothed) tongue-bottom, and the last line is that tongue-bottom straight
+    across to the closest wall point. Same (L, anchor_idx) contract as compute_vtd."""
+    L = _total_lines(n, even_total)
+    a_idx = anchor_indices(n, even_total)
+    nanL = np.full(L, np.nan, np.float32)
+    nanL2 = np.full((L, 2), np.nan, np.float32)
+    if roof is None or floor is None or len(roof) < 3 or len(floor) < 3:
+        return nanL, nanL2.copy(), nanL2.copy(), a_idx
+    R = np.asarray(roof, np.float32)
+    F = np.asarray(floor, np.float32)
+
+    # Posterior clip: drop rear-wall points beyond the nearest point to the tongue
+    # bottom, so the grid never extends below where the tongue reaches (req 3).
+    tb = None
+    if tongue_bottom is not None and np.all(np.isfinite(tongue_bottom)):
+        tb = np.asarray(tongue_bottom, np.float32)
+        wi = int(((R - tb[None, :]) ** 2).sum(1).argmin())
+        if wi >= 2:
+            R = R[: wi + 1]
+    if len(R) < 3:
+        return nanL, nanL2.copy(), nanL2.copy(), a_idx
+
+    mid = build_midline(R, F, recenter_iters)
+    if mid is None or len(mid) < 3:
+        return nanL, nanL2.copy(), nanL2.copy(), a_idx
+
+    # Velum split -> fraction on the midline (pins the middle index only).
+    if f_vel is None or not np.isfinite(f_vel):
+        f_vel = 0.5
+    p_vel = _point_at_fraction(R, float(f_vel))
+    _, s_vel, _ = _project_to_polyline(mid, p_vel)
+    s_vel = min(max(s_vel, 0.05), 0.95)
+    cum = _cumarc(mid)
+    s_abs = s_vel * cum[-1]
+    p_mid = _point_at_fraction(mid, s_vel)
+    oral = mid[cum <= s_abs]
+    oral = np.vstack([oral, p_mid[None, :]]) if len(oral) else np.vstack([mid[0][None, :], p_mid[None, :]])
+    phar = mid[cum >= s_abs]
+    phar = np.vstack([p_mid[None, :], phar]) if len(phar) else np.vstack([p_mid[None, :], mid[-1][None, :]])
+
+    k_o = n + 2
+    k_p = (n + 1) if even_total else (n + 2)
+    go = _resample(oral, k_o)
+    gp = _resample(phar, k_p)
+    if go is None or gp is None:
+        return nanL, nanL2.copy(), nanL2.copy(), a_idx
+    G = np.vstack([go, gp[1:]]).astype(np.float32)  # L midline stations
+
+    roof_pts = np.full((L, 2), np.nan, np.float32)
+    floor_pts = np.full((L, 2), np.nan, np.float32)
+    for i in range(L):
+        tang = G[min(L - 1, i + 1)] - G[max(0, i - 1)]
+        nrm = np.array([-tang[1], tang[0]], np.float32)
+        ln = float(np.linalg.norm(nrm))
+        if ln < 1e-6:
+            roof_pts[i], floor_pts[i] = _nearest_on(R, G[i]), _nearest_on(F, G[i])
+            continue
+        nrm /= ln
+        roof_pts[i], floor_pts[i] = _straddle_hits(G[i], nrm, R, F)
+
+    # Pin the two end anchors explicitly (req 3 for the posterior line).
+    roof_pts[0], floor_pts[0] = R[0], F[0]
+    if tb is not None:
+        floor_pts[-1] = tb
+        roof_pts[-1] = _nearest_on(R, tb)
+
+    vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
+    return vtd, roof_pts, floor_pts, a_idx
+
+
+def _grid_for_frame(roof, floor, vel_c, reg_up, n):
+    """Single-frame dispatch to the configured grid method (per-frame anchors, no
+    temporal smoothing). Used by the diagnostics so overlays match the method."""
+    if GRID_METHOD == "midline":
+        vcent = _velum_centroid(reg_up)
+        f_vel = None
+        if roof is not None and vcent is not None and len(roof) >= 3:
+            _, f_vel, _ = _project_to_polyline(roof, vcent)
+        tb = floor[-1] if (floor is not None and len(floor) >= 2) else None
+        return midline_grid(roof, floor, f_vel, tb, n, EVEN_TOTAL, RECENTER_ITERS)
+    return compute_vtd(roof, floor, vel_c, n, EVEN_TOTAL)
+
+
 # ── NPZ / frame helpers ──────────────────────────────────────────────────────
 
 
@@ -823,8 +1068,8 @@ def write_diagnostic_video(
             )
         else:
             canvas = np.full((fh, fw, 3), 20, np.uint8)
-        roof, floor, vel_c, _ = _frame_walls(regions, t, jaw_ref)
-        _, r, f, a_idx = compute_vtd(roof, floor, vel_c, n_gridlines, EVEN_TOTAL)
+        roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref)
+        _, r, f, a_idx = _grid_for_frame(roof, floor, vel_c, reg_up, n_gridlines)
         _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
@@ -853,7 +1098,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     label = spk if spk is not None else DATA_DIR.name
     mask_dir = base / "sam_seg" / "masks"
     video_dir = base / VIDEO_DIR
-    out_dir = base / "vtd"
+    out_dir = base / f"vtd_{GRID_METHOD}_{NORM_METHOD}"
 
     pattern = f"{spk}_*.npz" if spk is not None else "*.npz"
     mask_files = sorted(mask_dir.glob(pattern))
@@ -874,6 +1119,10 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
                 "total_lines": L,
                 "anchor_indices": a_idx,
                 "anchor_names": ["lips", "velum", "tongue_back"],
+                "grid_method": GRID_METHOD,
+                "norm_method": NORM_METHOD,
+                "anchor_smooth": ANCHOR_SMOOTH,
+                "recenter_iters": RECENTER_ITERS,
             },
             fh,
             indent=2,
@@ -881,6 +1130,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
     per_video = {}  # basename -> (mask_path, video_path, T)
     all_vtd = []
+    msize = int(ANCHOR_SMOOTH.get("median", 1))
+    sig = float(ANCHOR_SMOOTH.get("sigma", 0.0))
+    smooth_on = (sig > 0) or (msize > 1)
     for mp in tqdm(mask_files, desc=f"  {label} VTD"):
         basename = mp.stem
         regions, T = _load_regions(mp)
@@ -891,12 +1143,40 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
             if regions[TONGUE_SUB] is not None and regions[LOWER_LIP_SUB] is not None
             else None
         )
+        # Pass 1: trace walls + measure raw anchors (velum centroid fraction on the
+        # roof; tongue-bottom = posterior-most floor point). Cache walls for pass 2.
+        walls = []
+        f_vel_raw = np.full(T, np.nan, np.float32)
+        tb_raw = np.full((T, 2), np.nan, np.float32)
+        for t in range(T):
+            roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref)
+            walls.append((roof, floor, vel_c))
+            vcent = _velum_centroid(reg_up)
+            if roof is not None and vcent is not None and len(roof) >= 3:
+                _, f_vel_raw[t], _ = _project_to_polyline(roof, vcent)
+            if floor is not None and len(floor) >= 2:
+                tb_raw[t] = floor[-1]
+        # Temporally stabilize the anchors (no-op fill when smoothing disabled).
+        f_vel = stabilize(f_vel_raw, msize, sig)
+        tb = stabilize(tb_raw, msize, sig)
+        # Pass 2: compute VTD with the stabilized anchors.
         vtd = np.full((T, L), np.nan, np.float32)
         roof_pts = np.full((T, L, 2), np.nan, np.float32)
         floor_pts = np.full((T, L, 2), np.nan, np.float32)
         for t in range(T):
-            roof, floor, vel_c, _ = _frame_walls(regions, t, jaw_ref)
-            v, r, f, _ = compute_vtd(roof, floor, vel_c, n_gridlines, EVEN_TOTAL)
+            roof, floor, vel_c = walls[t]
+            if GRID_METHOD == "midline":
+                v, r, f, _ = midline_grid(
+                    roof, floor, f_vel[t], tb[t], n_gridlines, EVEN_TOTAL, RECENTER_ITERS
+                )
+            else:
+                # arc: use the stabilized velum split when smoothing is on, else the
+                # legacy per-frame velum center (byte-for-byte backward compatible).
+                if smooth_on and roof is not None and len(roof) >= 3 and np.isfinite(f_vel[t]):
+                    vc = _point_at_fraction(roof, float(f_vel[t]))
+                else:
+                    vc = vel_c
+                v, r, f, _ = compute_vtd(roof, floor, vc, n_gridlines, EVEN_TOTAL)
             vtd[t], roof_pts[t], floor_pts[t] = v, r, f
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
         np.savez(out_dir / "lines" / f"{basename}.npz", roof=roof_pts, floor=floor_pts)
@@ -909,27 +1189,38 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     if not all_vtd:
         return
 
-    # Per-speaker global min-max per grid line (Shi Eq. 3)
+    # Per-speaker per-grid-line normalization (norm_method).
     stacked = np.concatenate(all_vtd, axis=0)
     all_nan = np.all(np.isnan(stacked), axis=0)
-    with np.errstate(invalid="ignore"):
-        vmin = np.where(
-            all_nan, 0.0, np.nanmin(np.where(np.isnan(stacked), np.inf, stacked), 0)
-        )
-        vmax = np.where(
-            all_nan, 1.0, np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), 0)
-        )
-    rng = np.where((vmax - vmin) > 1e-6, vmax - vmin, 1.0)
+    if NORM_METHOD == "zscore":
+        with np.errstate(invalid="ignore"):
+            mean = np.where(all_nan, 0.0, np.nanmean(stacked, 0))
+            std = np.where(all_nan, 1.0, np.nanstd(stacked, 0))
+        std = np.where(std > 1e-6, std, 1.0)
+        hist_range = (-3.0, 3.0)
+    else:  # minmax (legacy behavior; Shi Eq. 3)
+        with np.errstate(invalid="ignore"):
+            vmin = np.where(
+                all_nan, 0.0, np.nanmin(np.where(np.isnan(stacked), np.inf, stacked), 0)
+            )
+            vmax = np.where(
+                all_nan, 1.0, np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), 0)
+            )
+        rng = np.where((vmax - vmin) > 1e-6, vmax - vmin, 1.0)
+        hist_range = (0.0, 1.0)
 
     for basename in per_video:
         vtd = np.load(out_dir / "pts" / f"{basename}.npy")
-        norm = np.clip((vtd - vmin[None, :]) / rng[None, :], 0.0, 1.0)
+        if NORM_METHOD == "zscore":
+            norm = (vtd - mean[None, :]) / std[None, :]
+        else:
+            norm = np.clip((vtd - vmin[None, :]) / rng[None, :], 0.0, 1.0)
         np.save(out_dir / "norm" / f"{basename}.npy", norm.astype(np.float32))
         hist = np.zeros((L, n_bins), np.float32)
         for l in range(L):
             col = norm[:, l][np.isfinite(norm[:, l])]
             if col.size:
-                hist[l], _ = np.histogram(col, bins=n_bins, range=(0.0, 1.0))
+                hist[l], _ = np.histogram(col, bins=n_bins, range=hist_range)
         np.save(out_dir / "hist" / f"{basename}.npy", hist)
 
     # Diagnostics: one static frame + up to n_videos overlay videos
@@ -944,8 +1235,8 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         else None
     )
     ti = T // 2
-    roof, floor, vel_c, _ = _frame_walls(regions, ti, jaw_ref)
-    _, r, f, a_idx = compute_vtd(roof, floor, vel_c, n_gridlines, EVEN_TOTAL)
+    roof, floor, vel_c, reg_up = _frame_walls(regions, ti, jaw_ref)
+    _, r, f, a_idx = _grid_for_frame(roof, floor, vel_c, reg_up, n_gridlines)
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
@@ -983,6 +1274,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 
 def main():
     global UPSCALE, PRE_SIGMA, SIGMA_PATH, EVEN_TOTAL
+    global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS
     single = not SPK_BASE
     p = argparse.ArgumentParser(
         description="Extract vocal-tract distance (VTD) from SAM2 masks."
@@ -1013,9 +1305,42 @@ def main():
         default="even" if EVEN_TOTAL else "odd",
         help="even -> 2n+2 grid lines; odd -> 2n+3.",
     )
+    p.add_argument(
+        "--grid-method",
+        choices=["arc", "midline"],
+        default=GRID_METHOD,
+        help="arc = legacy index-to-index; midline = normal cross-sections.",
+    )
+    p.add_argument(
+        "--norm-method",
+        choices=["minmax", "zscore"],
+        default=NORM_METHOD,
+        help="per-speaker per-grid-line normalization.",
+    )
+    p.add_argument(
+        "--anchor-median",
+        type=int,
+        default=int(ANCHOR_SMOOTH.get("median", 5)),
+        help="temporal median-filter window for anchors (<=1 disables).",
+    )
+    p.add_argument(
+        "--anchor-sigma",
+        type=float,
+        default=float(ANCHOR_SMOOTH.get("sigma", 2.5)),
+        help="temporal Gaussian sigma for anchors (0 disables).",
+    )
+    p.add_argument(
+        "--recenter-iters",
+        type=int,
+        default=RECENTER_ITERS,
+        help="midline medial-recentering iterations.",
+    )
     args = p.parse_args()
     UPSCALE, PRE_SIGMA, SIGMA_PATH = args.upscale, args.pre_sigma, args.sigma_path
     EVEN_TOTAL = args.parity == "even"
+    GRID_METHOD, NORM_METHOD = args.grid_method, args.norm_method
+    ANCHOR_SMOOTH = {"median": args.anchor_median, "sigma": args.anchor_sigma}
+    RECENTER_ITERS = args.recenter_iters
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")
