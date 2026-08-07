@@ -1082,7 +1082,13 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     only the two boundary crossings move (`measure_fixed_grid`) — the gridlines
     never move, which is what removes the per-frame geometry jitter. Returns a dict
     {O, N, a_idx} or None."""
-    roofs = [_resample(w[0], m) for w in walls if w[0] is not None and len(w[0]) >= 2]
+    # Roof reference = median of the dedicated roof-airway boundary (so Rref and the
+    # gridline geometry match what's measured). Floor reference = median traced floor.
+    roofs = [
+        _resample(w[3]["roof"][0], m)
+        for w in walls
+        if w[3].get("roof") and w[3]["roof"][0] is not None and len(w[3]["roof"][0]) >= 2
+    ]
     floors = [_resample(w[1], m) for w in walls if w[1] is not None and len(w[1]) >= 2]
     roofs = [r for r in roofs if r is not None]
     floors = [f for f in floors if f is not None]
@@ -1182,6 +1188,44 @@ def _region_contours(reg_up, subs):
     return out or None
 
 
+def _roof_airway(reg_up):
+    """Airway-facing roof boundary, built to be SMOOTH and STRAIGHT across the velum
+    port (never curling around the velum flap):
+      palate/upper-lip bottom edge (front, raw — NO aperture trim, so the lip is
+      stable) -> velum bottom edge traced to its ACTUAL bottom-most point -> a
+      single straight bridge from that bottom point to the rear wall -> wall airway
+      edge downward. Returns one open polyline in original coords, or None."""
+    palate = reg_up.get(ROOF_FRONT_SUB)
+    if palate is None or not np.asarray(palate).any():
+        return None
+    pal = _bottom_edge(np.asarray(palate).astype(np.uint8))  # airway-facing, ascending x
+    if pal is None or len(pal) < 2:
+        return None
+    parts = [pal]
+    tail = pal[-1]
+    velum = reg_up.get(VELUM_SUB)
+    if velum is not None and np.asarray(velum).any():
+        vel = _bottom_edge(np.asarray(velum).astype(np.uint8))
+        if len(vel) >= 2:
+            i, j = _closest_pair(pal, vel)  # splice palate <-> velum where they meet
+            bot = int(vel[:, 1].argmax())  # ACTUAL bottom-most (max-y) velum flesh point
+            velseg = vel[j : bot + 1] if bot >= j else vel[bot : j + 1][::-1]
+            if len(velseg) >= 1:
+                parts = [pal[: i + 1], velseg]
+                tail = vel[bot]  # bridge starts from the true bottom point (not the curl)
+    wall = reg_up.get(PHARYNX_SUB)
+    if wall is not None and np.asarray(wall).any():
+        wl = _left_edge(np.asarray(wall).astype(np.uint8))  # airway edge, ascending y
+        if len(wl) >= 2:
+            k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())  # nearest wall point
+            br = _bridge(tail, wl[k])  # ONE straight span, velum bottom -> wall
+            if len(br):
+                parts.append(br)
+            parts.append(wl[k:])  # wall airway edge downward
+    line = np.concatenate(parts, axis=0) / UPSCALE
+    return _smooth_path(line, SIGMA_PATH)
+
+
 def _contour_hit(origin, nrm, contours, ref_pt):
     """Where the fixed gridline crosses the raw mask contours, choosing the crossing
     nearest the reference point `ref_pt` (which sits on the airway-facing side).
@@ -1247,13 +1291,14 @@ def _utterance_anchors(regions, T, jaw_ref):
     tb_raw = np.full((T, 2), np.nan, np.float32)
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
+        ra = _roof_airway(reg_up)
         cont = {
             # floor: raw tongue(+lip) contour — single blob, airway edge is clean and
             # captures the curling back with no terminus landmark.
             "floor": _region_contours(reg_up, [TONGUE_SUB, LOWER_LIP_SUB]),
-            # roof: the TRACED build_roof line, which already bridges the velum->wall
-            # port with a straight span (no raw-contour curl around the velum flap).
-            "roof": [roof] if (roof is not None and len(roof) >= 2) else None,
+            # roof: dedicated airway boundary — raw palate/lip front (stable lip) +
+            # velum bottom edge to its bottom-most point + straight bridge to the wall.
+            "roof": [ra] if (ra is not None and len(ra) >= 2) else None,
         }
         walls.append((roof, floor, vel_c, cont))
         vcent = _velum_centroid(reg_up)
