@@ -1119,89 +1119,91 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         return None
     O = np.vstack([go[0], gp[0][1:]]).astype(np.float32)  # share the velum gridline
     N = np.vstack([go[1], gp[1][1:]]).astype(np.float32)
-    # Record where each gridline crosses the REFERENCE (median) floor, as a POINT.
-    # Per frame the raw tongue-contour crossing nearest this point is taken, so the
-    # last anchor's position is set once here from the median (no per-frame terminus).
-    cumF = _cumarc(ref_floor)
+    # Record where each gridline crosses the REFERENCE (median) roof and floor, as
+    # POINTS. Per frame, the raw-contour crossing nearest each of these is taken —
+    # so both wall anchors' positions are set once here from the median, and neither
+    # a curving tongue back nor a shortening upper-lip contour can make them snap.
+    Rref = np.zeros((len(O), 2), np.float32)
     Fref = np.zeros((len(O), 2), np.float32)
     for i in range(len(O)):
-        _, fp = _straddle_hits(O[i], N[i], R, ref_floor)
-        Fref[i] = fp
-    win_px = float(FIXED_WINDOW * cumF[-1]) if cumF[-1] > 0 else 20.0
+        rp, fp = _straddle_hits(O[i], N[i], ref_roof, ref_floor)
+        Rref[i], Fref[i] = rp, fp
     return {
         "O": O,
         "N": N,
         "a_idx": anchor_indices(n, even_total),
+        "Rref": Rref,
         "Fref": Fref,
-        "win_px": win_px,
     }
 
 
-def measure_fixed_grid(roof, floor_contour, grid):
-    """Measure VTD for one frame against a FIXED grid. The roof crossing is the
-    nearest intersection with the traced roof; the floor crossing is the raw
-    tongue-CONTOUR intersection nearest each gridline's reference floor point — no
-    terminus, no backside arc, so a curving tongue can't make it snap. VTD = distance
-    between the two crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
+def measure_fixed_grid(contours, grid):
+    """Measure VTD for one frame against a FIXED grid. BOTH walls are measured the
+    same way: for each fixed gridline, the raw-mask-contour crossing nearest that
+    gridline's reference point (Rref for the roof, Fref for the floor). No traced
+    polyline, no terminus, no arc — so neither a curving tongue back nor a shortening
+    upper-lip contour can make a connector snap. VTD = distance between the two
+    crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
     O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
-    Fref = grid.get("Fref")
+    Rref, Fref = grid.get("Rref"), grid.get("Fref")
     L = len(O)
     roof_pts = np.full((L, 2), np.nan, np.float32)
     floor_pts = np.full((L, 2), np.nan, np.float32)
-    if roof is None or len(roof) < 2:
-        return np.full(L, np.nan, np.float32), roof_pts, floor_pts, a_idx
-    R = np.asarray(roof, np.float32)
-    C = (
-        np.asarray(floor_contour, np.float32)
-        if (floor_contour is not None and len(floor_contour) >= 2)
-        else None
-    )
+    rc = contours.get("roof") if contours else None
+    fc = contours.get("floor") if contours else None
     for i in range(L):
-        tsr, ptsr = _line_crossings(O[i], N[i], R)
-        roof_pts[i] = ptsr[0] if ptsr is not None else _nearest_on(R, O[i])
-        ref_pt = Fref[i] if Fref is not None else O[i]
-        floor_pts[i] = (
-            _contour_floor_hit(O[i], N[i], C, ref_pt) if C is not None else ref_pt
-        )
+        r_ref = Rref[i] if Rref is not None else O[i]
+        f_ref = Fref[i] if Fref is not None else O[i]
+        roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
+        floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
 
-def _floor_contour(reg_up):
-    """Closed airway-facing contour of the tongue (union lower-lip) in original
-    coords, for direct gridline intersection. This is the RAW mask boundary — no
-    root/terminus landmark and no arc selection, so nothing snaps when the tongue
-    curves."""
-    tongue = reg_up.get(TONGUE_SUB)
-    if tongue is None or not np.asarray(tongue).any():
+def _region_contours(reg_up, subs):
+    """Closed mask-boundary polylines (ALL connected components) for the union of the
+    given regions, in original coords. Raw boundaries — no landmark/arc/terminus
+    definition, so nothing snaps or shortens when the tissue moves. Keeping all
+    components means a detached lip (or a disconnected wall) is never dropped."""
+    union = None
+    for s in subs:
+        m = reg_up.get(s)
+        if m is not None and np.asarray(m).any():
+            mb = np.asarray(m).astype(bool)
+            union = mb if union is None else (union | mb)
+    if union is None or not union.any():
         return None
-    union = np.asarray(tongue).astype(bool)
-    lower = reg_up.get(LOWER_LIP_SUB)
-    if lower is not None and np.asarray(lower).any():
-        union = union | np.asarray(lower).astype(bool)
-    core = _largest_component(union).astype(np.uint8)
-    cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cs:
-        return None
-    pts = max(cs, key=len).squeeze()
-    if pts.ndim != 2 or len(pts) < 4:
-        return None
-    pts = np.vstack([pts, pts[0]]).astype(np.float32)  # close the loop
-    return pts / UPSCALE
+    cs, _ = cv2.findContours(union.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out = []
+    for c in cs:
+        pts = c.squeeze()
+        if pts.ndim == 2 and len(pts) >= 3:
+            out.append((np.vstack([pts, pts[0]]).astype(np.float32)) / UPSCALE)  # closed
+    return out or None
 
 
-def _contour_floor_hit(origin, nrm, contour, ref_pt):
-    """Where the fixed gridline crosses the tongue CONTOUR, choosing the crossing
-    nearest the reference floor point `ref_pt` (which sits on the airway-facing
-    side). Robust to a curving tongue: no terminus, just the mask edge along this
-    fixed line, disambiguated by proximity to where the reference said the tongue is.
-    The result is ALWAYS on tissue — if the line misses the contour entirely, it
-    falls back to the nearest contour point, never to a spot floating in the airway."""
-    ts, pts = _line_crossings(origin, nrm, contour)
-    if pts is None:
-        return _nearest_on(contour, ref_pt)
-    d = np.sqrt(((pts - np.asarray(ref_pt, np.float32)[None, :]) ** 2).sum(1))
-    return pts[int(d.argmin())]
+def _contour_hit(origin, nrm, contours, ref_pt):
+    """Where the fixed gridline crosses the raw mask contours, choosing the crossing
+    nearest the reference point `ref_pt` (which sits on the airway-facing side).
+    Robust to a moving/curving/shortening boundary: no landmark, just the mask edge
+    along this fixed line, disambiguated by proximity to the reference. ALWAYS on
+    tissue — if the line misses every component, falls back to the nearest contour
+    point, never to a spot floating in the airway."""
+    ref = np.asarray(ref_pt, np.float32)
+    best, best_d = None, np.inf
+    near_pt, near_d = None, np.inf
+    for C in contours:
+        ts, pts = _line_crossings(origin, nrm, C)
+        if pts is not None:
+            d = np.sqrt(((pts - ref[None, :]) ** 2).sum(1))
+            j = int(d.argmin())
+            if d[j] < best_d:
+                best_d, best = d[j], pts[j]
+        dd = ((C - ref[None, :]) ** 2).sum(1)
+        jj = int(dd.argmin())
+        if dd[jj] < near_d:
+            near_d, near_pt = dd[jj], C[jj]
+    return best if best is not None else near_pt
 
 
 def _utterance_anchors(regions, T, jaw_ref):
@@ -1245,7 +1247,11 @@ def _utterance_anchors(regions, T, jaw_ref):
     tb_raw = np.full((T, 2), np.nan, np.float32)
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
-        walls.append((roof, floor, vel_c, _floor_contour(reg_up)))
+        cont = {
+            "floor": _region_contours(reg_up, [TONGUE_SUB, LOWER_LIP_SUB]),
+            "roof": _region_contours(reg_up, [ROOF_FRONT_SUB, VELUM_SUB, PHARYNX_SUB]),
+        }
+        walls.append((roof, floor, vel_c, cont))
         vcent = _velum_centroid(reg_up)
         if roof is not None and vcent is not None and len(roof) >= 3:
             _, f_raw[t], _ = _project_to_polyline(roof, vcent)
@@ -1264,12 +1270,12 @@ def _utterance_anchors(regions, T, jaw_ref):
     return walls, f_vel, tb
 
 
-def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, floor_contour=None):
+def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, contours=None):
     """Single-frame VTD for the configured grid method using precomputed anchors.
-    When `fixed_grid` is provided (grid_method='fixed'), measure the floor against the
-    raw tongue contour."""
+    When `fixed_grid` is provided (grid_method='fixed'), measure both walls against
+    the raw mask contours."""
     if fixed_grid is not None:
-        return measure_fixed_grid(roof, floor_contour, fixed_grid)
+        return measure_fixed_grid(contours, fixed_grid)
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
@@ -1522,9 +1528,9 @@ def write_diagnostic_video(
             )
         else:
             canvas = np.full((fh, fw, 3), 20, np.uint8)
-        roof, floor, vel_c, fcont = walls[t]
+        roof, floor, vel_c, cont = walls[t]
         _, r, f, a_idx = _grid_with_anchors(
-            roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid, fcont
+            roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid, cont
         )
         _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
         writer.write(canvas)
@@ -1625,9 +1631,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         roof_pts = np.full((T, L, 2), np.nan, np.float32)
         floor_pts = np.full((T, L, 2), np.nan, np.float32)
         for t in range(T):
-            roof, floor, vel_c, fcont = walls[t]
+            roof, floor, vel_c, cont = walls[t]
             v, r, f, _ = _grid_with_anchors(
-                roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid, fcont
+                roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid, cont
             )
             vtd[t], roof_pts[t], floor_pts[t] = v, r, f
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
@@ -1695,9 +1701,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         if GRID_METHOD == "fixed"
         else None
     )
-    roof, floor, vel_c, fcont = walls_d[ti]
+    roof, floor, vel_c, cont = walls_d[ti]
     _, r, f, a_idx = _grid_with_anchors(
-        roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines, fixed_grid_d, fcont
+        roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines, fixed_grid_d, cont
     )
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
