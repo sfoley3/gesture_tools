@@ -1320,6 +1320,11 @@ def write_diagnostic_video(
         else None
     )
     fps = (cap.get(cv2.CAP_PROP_FPS) or 50.0) if cap is not None else 50.0
+    # mpeg4 (mp4v) requires a timebase denominator <= 65535; a fractional source
+    # rate like 81.967 fps yields 1000/81967 and fails to open the writer. Round to
+    # an integer (and guard against absurd/zero values) for the diagnostic video.
+    fps = float(fps)
+    fps = round(fps) if np.isfinite(fps) and 1.0 <= fps <= 240.0 else 50
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
