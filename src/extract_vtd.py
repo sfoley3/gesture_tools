@@ -1145,7 +1145,6 @@ def measure_fixed_grid(roof, floor_contour, grid):
     between the two crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
     O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
     Fref = grid.get("Fref")
-    win = float(grid.get("win_px", 20.0))
     L = len(O)
     roof_pts = np.full((L, 2), np.nan, np.float32)
     floor_pts = np.full((L, 2), np.nan, np.float32)
@@ -1162,7 +1161,7 @@ def measure_fixed_grid(roof, floor_contour, grid):
         roof_pts[i] = ptsr[0] if ptsr is not None else _nearest_on(R, O[i])
         ref_pt = Fref[i] if Fref is not None else O[i]
         floor_pts[i] = (
-            _contour_floor_hit(O[i], N[i], C, ref_pt, win) if C is not None else ref_pt
+            _contour_floor_hit(O[i], N[i], C, ref_pt) if C is not None else ref_pt
         )
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
@@ -1191,18 +1190,18 @@ def _floor_contour(reg_up):
     return pts / UPSCALE
 
 
-def _contour_floor_hit(origin, nrm, contour, ref_pt, win):
+def _contour_floor_hit(origin, nrm, contour, ref_pt):
     """Where the fixed gridline crosses the tongue CONTOUR, choosing the crossing
     nearest the reference floor point `ref_pt` (which sits on the airway-facing
     side). Robust to a curving tongue: no terminus, just the mask edge along this
-    fixed line, disambiguated by proximity to where the reference said the tongue
-    is. Falls back to `ref_pt` when the line misses the contour locally."""
+    fixed line, disambiguated by proximity to where the reference said the tongue is.
+    The result is ALWAYS on tissue — if the line misses the contour entirely, it
+    falls back to the nearest contour point, never to a spot floating in the airway."""
     ts, pts = _line_crossings(origin, nrm, contour)
     if pts is None:
-        return ref_pt
+        return _nearest_on(contour, ref_pt)
     d = np.sqrt(((pts - np.asarray(ref_pt, np.float32)[None, :]) ** 2).sum(1))
-    j = int(d.argmin())
-    return pts[j] if d[j] <= win else ref_pt
+    return pts[int(d.argmin())]
 
 
 def _utterance_anchors(regions, T, jaw_ref):
