@@ -1148,28 +1148,28 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
 
 
 def measure_fixed_grid(contours, grid):
-    """Measure VTD for one frame against a FIXED grid — the simple perpendicular
-    straddle. Each gridline (origin O[i], normal N[i]) was placed ONCE, evenly along
-    the reference midline; here we only measure the airway width along it: the roof
-    crossing nearest the origin, and the floor crossing on the OPPOSITE side of the
-    origin (`_straddle_hits`). Because the roof and floor are two SEPARATE airway-
-    facing walls, every line is a straight perpendicular cross-section that spans the
-    airway (e.g. tongue back -> rear wall) and can NEVER cut across the tongue, connect
-    the tongue back to the tongue front, or cross a neighbouring line. Falls back to
-    the nearest wall point when a line misses. VTD = distance between the two
-    crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
+    """Measure VTD for one frame against a FIXED grid. BOTH walls are measured the
+    same way: for each fixed gridline, the raw-mask-contour crossing nearest that
+    gridline's REFERENCE point (Rref for the roof, Fref for the floor). The reference
+    points are set ONCE in `build_fixed_grid` from the clean per-file median geometry,
+    so for the posterior gridlines Rref sits on the rear wall — anchoring to it is what
+    makes the roof point snap to the rear-wall crossing and never the palate, even
+    though both belong to the same roof polyline. No traced polyline, no terminus, no
+    arc — so neither a curving tongue back nor a shortening upper-lip contour makes a
+    connector snap. VTD = distance between the two crossings. Returns
+    (vtd (L,), roof_pts, floor_pts, a_idx)."""
     O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
+    Rref, Fref = grid.get("Rref"), grid.get("Fref")
     L = len(O)
     roof_pts = np.full((L, 2), np.nan, np.float32)
     floor_pts = np.full((L, 2), np.nan, np.float32)
     rc = contours.get("roof") if contours else None
     fc = contours.get("floor") if contours else None
-    R = rc[0] if (rc and rc[0] is not None and len(rc[0]) >= 2) else None
-    F = fc[0] if (fc and fc[0] is not None and len(fc[0]) >= 2) else None
-    if R is None or F is None:
-        return np.full(L, np.nan, np.float32), roof_pts, floor_pts, a_idx
     for i in range(L):
-        roof_pts[i], floor_pts[i] = _straddle_hits(O[i], N[i], R, F)
+        r_ref = Rref[i] if Rref is not None else O[i]
+        f_ref = Fref[i] if Fref is not None else O[i]
+        roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
+        floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
