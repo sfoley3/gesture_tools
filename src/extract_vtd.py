@@ -1032,12 +1032,16 @@ def midline_grid(
     R = np.asarray(roof, np.float32)
     F = np.asarray(floor, np.float32)
 
-    # Posterior clip: drop rear-wall points beyond the nearest point to the tongue
-    # bottom, so the grid never extends below where the tongue reaches (req 3).
+    # Posterior clip: cut the rear wall at the tongue-bottom DEPTH (walk down the wall),
+    # so the grid never extends below where the tongue reaches — but keep the whole wall
+    # above that depth. Euclidean-nearest clipping would chop the wall off at a dipping
+    # velum (see build_fixed_grid), collapsing the pharyngeal cavity.
     tb = None
     if tongue_bottom is not None and np.all(np.isfinite(tongue_bottom)):
         tb = np.asarray(tongue_bottom, np.float32)
-        wi = int(((R - tb[None, :]) ** 2).sum(1).argmin())
+        y_t = float(tb[1])
+        below = np.where(R[:, 1] <= y_t + 1.0)[0]
+        wi = int(below.max()) if len(below) else int(((R - tb[None, :]) ** 2).sum(1).argmin())
         if wi >= 2:
             R = R[: wi + 1]
     if len(R) < 3:
@@ -1109,9 +1113,22 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     )
     R = ref_roof
     if np.all(np.isfinite(ref_tb)):
-        wi = int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
+        # Clip the rear wall at the tongue-bottom DEPTH (walk DOWN the wall), NOT at the
+        # euclidean-nearest roof point. A dipping velum can be euclidean-closer to the
+        # tongue bottom than the far rear wall is, so nearest-point clipping chops the
+        # whole pharyngeal wall off — collapsing the pharyngeal cavity to a stub, so the
+        # posterior gridlines fan out from the velum and their roof ends land back on the
+        # palate. Taking the LAST roof point at/above the terminus depth keeps the wall
+        # down to where the tongue reaches.
+        y_t = float(ref_tb[1])
+        below = np.where(R[:, 1] <= y_t + 1.0)[0]
+        wi = (
+            int(below.max())
+            if len(below)
+            else int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
+        )
         if wi >= 2:
-            R = R[: wi + 1]  # clip rear wall at the reference terminus
+            R = R[: wi + 1]  # clip rear wall at the reference terminus depth
     F = ref_floor
     if len(R) < 3 or len(F) < 3:
         return None
