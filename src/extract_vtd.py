@@ -103,6 +103,7 @@ _DEFAULT_CFG = {
     "floor_front": "skyline",  # {skyline, contour} tongue/lip surface tracing for the floor
     "velum_anchor": "median",  # {median, smooth} velum split: per-video median fraction (firm) vs per-frame smoothed
     "wall_bottom": "median",  # {median, smooth} pharyngeal-wall bottom (tongue-back terminus ref): firm vs smoothed
+    "jump_thresh": {"frac": 0.15, "px": 10.0},  # anchor jump limits: velum fraction / position (px). carry-forward on jump or dropout
     "session": None,  # session subdir for longitudinal data ({spk}/{session}/...); None = flat
 }
 
@@ -139,6 +140,7 @@ RECENTER_ITERS = int(_cfg.get("recenter_iters", 1))
 FLOOR_FRONT = str(_cfg.get("floor_front", "skyline"))
 VELUM_ANCHOR = str(_cfg.get("velum_anchor", "median"))
 WALL_BOTTOM = str(_cfg.get("wall_bottom", "median"))
+JUMP_THRESH = dict(_cfg.get("jump_thresh", {"frac": 0.15, "px": 10.0}))
 MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
@@ -845,6 +847,39 @@ def stabilize(arr, median_size=5, sigma=2.5):
     return out if two_d else out[:, 0]
 
 
+def _hold_jumps(x, thresh, max_hold=3):
+    """Suppress transient anchor glitches: if a frame jumps more than `thresh` from
+    the last accepted value (or the mask is missing), carry the last value forward —
+    but only for up to `max_hold` consecutive frames, after which the new level is
+    accepted as genuine motion (not a glitch). This is the velum-disappears /
+    fragmentation fallback: use the previous position instead of the jumped one.
+    Accepts (T,) or (T,2)."""
+    x = np.asarray(x, np.float64).copy()
+    two = x.ndim == 2
+    last = None
+    held = 0
+    for t in range(len(x)):
+        v = x[t]
+        ok = bool(np.all(np.isfinite(v))) if two else bool(np.isfinite(v))
+        if last is None:
+            if ok:
+                last = v.copy() if two else v
+            continue
+        if not ok:  # dropout -> hold previous
+            if held < max_hold:
+                x[t] = last
+                held += 1
+            continue
+        d = float(np.linalg.norm(v - last)) if two else abs(float(v - last))
+        if d > thresh and held < max_hold:  # jump -> hold previous
+            x[t] = last
+            held += 1
+        else:
+            last = v.copy() if two else v
+            held = 0
+    return x
+
+
 def _line_crossings(origin, ndir, poly):
     """All signed intersections of the infinite line (origin + t*ndir) with an
     (M,2) polyline, sorted by |t| (t is signed distance since |ndir|=1). Returns
@@ -908,6 +943,36 @@ def build_midline(roof, floor, recenter_iters=1, m=150, sigma=3.0):
     return mid
 
 
+def _cavity_grid(roof_seg, floor_seg, k, recenter_iters=1):
+    """One cavity's grid: k stations spaced evenly along the cavity midline, each
+    measured as a straight cross-section PERPENDICULAR to the local midline (a
+    straddle hit on each wall). This is the identical method used in both cavities,
+    so posterior connectors are straight and parallel like the anterior — never the
+    nearest-vertex fan. Returns (roof_pts (k,2), floor_pts (k,2)) or None."""
+    R = np.asarray(roof_seg, np.float32)
+    F = np.asarray(floor_seg, np.float32)
+    if len(R) < 2 or len(F) < 2:
+        return None
+    mid = build_midline(R, F, recenter_iters)
+    if mid is None or len(mid) < 2:
+        return None
+    G = _resample(mid, k)
+    if G is None or len(G) != k:
+        return None
+    rp = np.full((k, 2), np.nan, np.float32)
+    fp = np.full((k, 2), np.nan, np.float32)
+    for i in range(k):
+        tang = G[min(k - 1, i + 1)] - G[max(0, i - 1)]
+        nrm = np.array([-tang[1], tang[0]], np.float32)
+        ln = float(np.linalg.norm(nrm))
+        if ln < 1e-6:
+            rp[i], fp[i] = _nearest_on(R, G[i]), _nearest_on(F, G[i])
+        else:
+            nrm /= ln
+            rp[i], fp[i] = _straddle_hits(G[i], nrm, R, F)
+    return rp, fp
+
+
 def midline_grid(
     roof, floor, f_vel, tongue_bottom, n, even_total=False, recenter_iters=1
 ):
@@ -937,69 +1002,32 @@ def midline_grid(
     if len(R) < 3:
         return nanL, nanL2.copy(), nanL2.copy(), a_idx
 
-    mid = build_midline(R, F, recenter_iters)
-    if mid is None or len(mid) < 3:
-        return nanL, nanL2.copy(), nanL2.copy(), a_idx
-
-    # Velum split -> fraction on the midline (pins the middle index only).
+    # Velum split: the fraction pins the oral/pharyngeal boundary on each wall.
     if f_vel is None or not np.isfinite(f_vel):
         f_vel = 0.5
     p_vel = _point_at_fraction(R, float(f_vel))
-    _, s_vel, _ = _project_to_polyline(mid, p_vel)
-    s_vel = min(max(s_vel, 0.05), 0.95)
-    cum = _cumarc(mid)
-    s_abs = s_vel * cum[-1]
-    p_mid = _point_at_fraction(mid, s_vel)
-    oral = mid[cum <= s_abs]
-    oral = (
-        np.vstack([oral, p_mid[None, :]])
-        if len(oral)
-        else np.vstack([mid[0][None, :], p_mid[None, :]])
-    )
-    phar = mid[cum >= s_abs]
-    phar = (
-        np.vstack([p_mid[None, :], phar])
-        if len(phar)
-        else np.vstack([p_mid[None, :], mid[-1][None, :]])
-    )
+    i_ru = _split_index(R, p_vel)  # boundary index on the roof
+    i_rf = _split_index(F, R[i_ru])  # matching boundary on the floor
 
     k_o = n + 2
     k_p = (n + 1) if even_total else (n + 2)
-    go = _resample(oral, k_o)
-    gp = _resample(phar, k_p)
-    if go is None or gp is None:
+    # BOTH cavities use the identical method: even midline stations, straight
+    # cross-section perpendicular to the local tract axis. Building each cavity's
+    # midline from its own wall segments lets the pharyngeal midline reach the
+    # terminus, so the last station lands near tb without a jump.
+    og = _cavity_grid(R[: i_ru + 1], F[: i_rf + 1], k_o, recenter_iters)
+    pg = _cavity_grid(R[i_ru:], F[i_rf:], k_p, recenter_iters)
+    if og is None or pg is None:
         return nanL, nanL2.copy(), nanL2.copy(), a_idx
-    G = np.vstack([go, gp[1:]]).astype(np.float32)  # L midline stations
+    roof_pts = np.vstack([og[0], pg[0][1:]]).astype(np.float32)  # share velum point
+    floor_pts = np.vstack([og[1], pg[1][1:]]).astype(np.float32)
 
-    roof_pts = np.full((L, 2), np.nan, np.float32)
-    floor_pts = np.full((L, 2), np.nan, np.float32)
-    for i in range(L):
-        tang = G[min(L - 1, i + 1)] - G[max(0, i - 1)]
-        nrm = np.array([-tang[1], tang[0]], np.float32)
-        ln = float(np.linalg.norm(nrm))
-        if ln < 1e-6:
-            roof_pts[i], floor_pts[i] = _nearest_on(R, G[i]), _nearest_on(F, G[i])
-            continue
-        nrm /= ln
-        roof_pts[i], floor_pts[i] = _straddle_hits(G[i], nrm, R, F)
-
+    # Pin the endpoints: lips, and the tongue-bottom terminus straight across to the
+    # nearest rear-wall point (a small correction now that the midline reaches tb).
     roof_pts[0], floor_pts[0] = R[0], F[0]
     if tb is not None:
-        # Posterior cavity: evenly space the tongue points along the FLOOR from the
-        # velum split down to the tongue-bottom terminus, so the last point (tb) is
-        # a natural, evenly-spaced endpoint rather than an override that leaves a gap
-        # before it. Each connects straight to the nearest rear-wall point (shortest
-        # cross-distance), and the terminus is tb -> closest wall point.
-        v_idx = a_idx[1]
-        j0 = int(((F - floor_pts[v_idx][None, :]) ** 2).sum(1).argmin())
-        ev_pts = _resample(F[j0:], L - v_idx)  # split..tb, evenly spaced, tb last
-        if ev_pts is not None and len(ev_pts) == L - v_idx:
-            floor_pts[v_idx:] = ev_pts
-            for i in range(v_idx, L):
-                roof_pts[i] = _nearest_on(R, floor_pts[i])
-        else:
-            floor_pts[-1] = tb
-            roof_pts[-1] = _nearest_on(R, tb)
+        floor_pts[-1] = tb
+        roof_pts[-1] = _nearest_on(R, tb)
 
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
@@ -1032,6 +1060,7 @@ def _utterance_anchors(regions, T, jaw_ref):
             wl = _wall_bottom_pixel(wall_masks[t])
             if wl is not None:
                 w_raw[t] = wl
+    w_raw = _hold_jumps(w_raw, JUMP_THRESH.get("px", 10.0))
     if WALL_BOTTOM == "median" and np.isfinite(w_raw).any():
         wm = np.array(
             [np.nanmedian(w_raw[:, 0]), np.nanmedian(w_raw[:, 1])], np.float32
@@ -1051,9 +1080,13 @@ def _utterance_anchors(regions, T, jaw_ref):
             _, f_raw[t], _ = _project_to_polyline(roof, vcent)
         if floor is not None and len(floor) >= 2:
             tb_raw[t] = floor[-1]
+    # Combat velum-mask dropouts/fragmentation and terminus glitches: carry the
+    # previous position through transient jumps before firming.
+    f_raw = _hold_jumps(f_raw, JUMP_THRESH.get("frac", 0.15))
+    tb_raw = _hold_jumps(tb_raw, JUMP_THRESH.get("px", 10.0))
     if VELUM_ANCHOR == "median":
         fm = float(np.nanmedian(f_raw)) if np.isfinite(f_raw).any() else np.nan
-        f_vel = np.full(T, fm, np.float64)
+        f_vel = np.full(T, fm, np.float64)  # NaN -> midline_grid falls back to 0.5
     else:  # "smooth"
         f_vel = stabilize(f_raw, msize, sig)
     tb = stabilize(tb_raw, msize, sig)
