@@ -1089,7 +1089,11 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         for w in walls
         if w[3].get("roof") and w[3]["roof"][0] is not None and len(w[3]["roof"][0]) >= 2
     ]
-    floors = [_resample(w[1], m) for w in walls if w[1] is not None and len(w[1]) >= 2]
+    floors = [
+        _resample(w[3]["floor"][0], m)
+        for w in walls
+        if w[3].get("floor") and w[3]["floor"][0] is not None and len(w[3]["floor"][0]) >= 2
+    ]
     roofs = [r for r in roofs if r is not None]
     floors = [f for f in floors if f is not None]
     if not roofs or not floors:
@@ -1226,6 +1230,50 @@ def _roof_airway(reg_up):
     return _smooth_path(line, SIGMA_PATH)
 
 
+def _floor_airway(reg_up):
+    """Airway-facing floor boundary (the floor twin of `_roof_airway`): the smooth
+    UPPER ENVELOPE of the tongue(+lower-lip) from the lip aperture back to the tongue
+    root, then the tongue backside for the curl. The upper envelope (per-column top
+    of the union) traces the real lip edge, is single-valued in x — so it is smooth
+    across the lip->tongue front, never curls under, and its cross-connectors can't
+    cross — while the backside still captures the curling tongue back. One open
+    polyline in original coords, or None."""
+    tongue = reg_up.get(TONGUE_SUB)
+    if tongue is None or not np.asarray(tongue).any():
+        return None
+    tb = np.asarray(tongue).astype(bool)
+    lower = reg_up.get(LOWER_LIP_SUB)
+    union = (
+        tb | np.asarray(lower).astype(bool)
+        if (lower is not None and np.asarray(lower).any())
+        else tb
+    )
+    front = _top_edge(union.astype(np.uint8))  # smooth upper envelope: lip -> dorsum
+    if front is None or len(front) < 2:
+        return None
+    root_x = float(np.where(tb)[1].max())
+    front = front[front[:, 0] <= root_x + 0.5]  # up to the tongue root
+    # Start at the lip aperture (drop the external lip front outside the tract).
+    upper_lip = reg_up.get(ROOF_FRONT_SUB)
+    if upper_lip is not None and np.asarray(upper_lip).any() and lower is not None and np.asarray(lower).any():
+        ub = _bottom_edge(np.asarray(upper_lip).astype(np.uint8))
+        lt = _top_edge(np.asarray(lower).astype(np.uint8))
+        if len(ub) and len(lt):
+            d, _idx = cKDTree(ub).query(lt)
+            ap = lt[int(d.argmin())]
+            front = front[front[:, 0] >= ap[0] - 0.5]
+            if len(front) == 0:
+                front = ap[None, :]
+            elif not np.allclose(front[0], ap):
+                front = np.vstack([ap[None, :], front])
+    parts = [front]
+    backside = _tongue_backside(tb.astype(np.uint8), None)  # root -> tongue bottom (curl)
+    if backside is not None and len(backside) >= 1:
+        parts.append(backside[1:] if len(backside) > 1 else backside)
+    line = np.concatenate(parts, axis=0) / UPSCALE
+    return _smooth_path(line, SIGMA_PATH)
+
+
 def _contour_hit(origin, nrm, contours, ref_pt):
     """Where the fixed gridline crosses the raw mask contours, choosing the crossing
     nearest the reference point `ref_pt` (which sits on the airway-facing side).
@@ -1292,12 +1340,13 @@ def _utterance_anchors(regions, T, jaw_ref):
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
         ra = _roof_airway(reg_up)
+        fa = _floor_airway(reg_up)
         cont = {
-            # floor: raw tongue(+lip) contour — single blob, airway edge is clean and
-            # captures the curling back with no terminus landmark.
-            "floor": _region_contours(reg_up, [TONGUE_SUB, LOWER_LIP_SUB]),
-            # roof: dedicated airway boundary — raw palate/lip front (stable lip) +
-            # velum bottom edge to its bottom-most point + straight bridge to the wall.
+            # floor: airway upper envelope (lip -> tongue, smooth, no curl under) +
+            # tongue backside for the curl. Traces the lip edge; no front crossing.
+            "floor": [fa] if (fa is not None and len(fa) >= 2) else None,
+            # roof: raw palate/lip front (stable lip) + velum bottom to its bottom-most
+            # point + straight bridge to the wall.
             "roof": [ra] if (ra is not None and len(ra) >= 2) else None,
         }
         walls.append((roof, floor, vel_c, cont))
@@ -1581,10 +1630,11 @@ def write_diagnostic_video(
         _, r, f, a_idx = _grid_with_anchors(
             roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid, cont
         )
-        # Draw the actual boundary the points are measured against: in fixed mode the
-        # roof is the airway-boundary (bridged velum), not the build_roof curl.
+        # Draw the actual boundaries the points are measured against (airway roof/
+        # floor) in fixed mode, not the build_roof/build_floor traces.
         roof_draw = cont["roof"][0] if (fixed_grid is not None and cont.get("roof")) else roof
-        _draw_overlay_bgr(canvas, regions, t, roof_draw, floor, r, f, scale, a_idx)
+        floor_draw = cont["floor"][0] if (fixed_grid is not None and cont.get("floor")) else floor
+        _draw_overlay_bgr(canvas, regions, t, roof_draw, floor_draw, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
         cap.release()
@@ -1758,13 +1808,14 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines, fixed_grid_d, cont
     )
     roof_draw = cont["roof"][0] if (fixed_grid_d is not None and cont.get("roof")) else roof
+    floor_draw = cont["floor"][0] if (fixed_grid_d is not None and cont.get("floor")) else floor
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
         ti,
         vpath,
         roof_draw,
-        floor,
+        floor_draw,
         r,
         f,
         a_idx,
