@@ -943,12 +943,12 @@ def build_midline(roof, floor, recenter_iters=1, m=150, sigma=3.0):
     return mid
 
 
-def _cavity_grid(roof_seg, floor_seg, k, recenter_iters=1):
-    """One cavity's grid: k stations spaced evenly along the cavity midline, each
-    measured as a straight cross-section PERPENDICULAR to the local midline (a
-    straddle hit on each wall). This is the identical method used in both cavities,
-    so posterior connectors are straight and parallel like the anterior — never the
-    nearest-vertex fan. Returns (roof_pts (k,2), floor_pts (k,2)) or None."""
+def _cavity_gridlines(roof_seg, floor_seg, k, recenter_iters=1):
+    """Fixed gridline geometry for one cavity, per the original VTD construction:
+    k origins spaced EVENLY along the cavity midline, each with the perpendicular
+    direction (normal to the local midline). Returns (origins (k,2), normals (k,2))
+    or None. The gridlines curve/fan with the midline through the bend (the semi-
+    polar shape). VTD is later the airway width along each gridline."""
     R = np.asarray(roof_seg, np.float32)
     F = np.asarray(floor_seg, np.float32)
     if len(R) < 2 or len(F) < 2:
@@ -959,17 +959,30 @@ def _cavity_grid(roof_seg, floor_seg, k, recenter_iters=1):
     G = _resample(mid, k)
     if G is None or len(G) != k:
         return None
-    rp = np.full((k, 2), np.nan, np.float32)
-    fp = np.full((k, 2), np.nan, np.float32)
+    N = np.zeros((k, 2), np.float32)
     for i in range(k):
         tang = G[min(k - 1, i + 1)] - G[max(0, i - 1)]
         nrm = np.array([-tang[1], tang[0]], np.float32)
         ln = float(np.linalg.norm(nrm))
-        if ln < 1e-6:
-            rp[i], fp[i] = _nearest_on(R, G[i]), _nearest_on(F, G[i])
-        else:
-            nrm /= ln
-            rp[i], fp[i] = _straddle_hits(G[i], nrm, R, F)
+        N[i] = nrm / ln if ln > 1e-6 else np.array([0.0, 1.0], np.float32)
+    return G.astype(np.float32), N
+
+
+def _cavity_grid(roof_seg, floor_seg, k, recenter_iters=1):
+    """One cavity's grid (per-frame midline mode): k gridlines evenly along the
+    cavity midline, VTD = width between BOTH walls along each perpendicular gridline
+    (a straddle hit on each wall). Even quantity is the gridlines along the midline
+    (as in the original VTD), not either wall. Returns (roof_pts, floor_pts) or None."""
+    gl = _cavity_gridlines(roof_seg, floor_seg, k, recenter_iters)
+    if gl is None:
+        return None
+    O, N = gl
+    R = np.asarray(roof_seg, np.float32)
+    F = np.asarray(floor_seg, np.float32)
+    rp = np.full((k, 2), np.nan, np.float32)
+    fp = np.full((k, 2), np.nan, np.float32)
+    for i in range(k):
+        rp[i], fp[i] = _straddle_hits(O[i], N[i], R, F)
     return rp, fp
 
 
@@ -1029,6 +1042,73 @@ def midline_grid(
         floor_pts[-1] = tb
         roof_pts[-1] = _nearest_on(R, tb)
 
+    vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
+    return vtd, roof_pts, floor_pts, a_idx
+
+
+def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=200):
+    """Build ONE fixed grid for the whole clip (original-VTD style). The reference
+    roof and floor are the per-point MEDIAN of the traced walls over all frames;
+    split at the median velum fraction into oral/pharyngeal cavities; lay fixed
+    perpendicular gridlines evenly along each cavity's reference midline. Per frame
+    only the two boundary crossings move (`measure_fixed_grid`) — the gridlines
+    never move, which is what removes the per-frame geometry jitter. Returns a dict
+    {O, N, a_idx} or None."""
+    roofs = [_resample(r, m) for (r, f, vc) in walls if r is not None and len(r) >= 2]
+    floors = [_resample(f, m) for (r, f, vc) in walls if f is not None and len(f) >= 2]
+    roofs = [r for r in roofs if r is not None]
+    floors = [f for f in floors if f is not None]
+    if not roofs or not floors:
+        return None
+    with np.errstate(invalid="ignore"):
+        ref_roof = np.nanmedian(np.stack(roofs, 0), axis=0).astype(np.float32)
+        ref_floor = np.nanmedian(np.stack(floors, 0), axis=0).astype(np.float32)
+    tb = np.asarray(tb, np.float32)
+    ref_tb = (
+        np.array([np.nanmedian(tb[:, 0]), np.nanmedian(tb[:, 1])], np.float32)
+        if np.isfinite(tb).any()
+        else ref_floor[-1]
+    )
+    R = ref_roof
+    if np.all(np.isfinite(ref_tb)):
+        wi = int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
+        if wi >= 2:
+            R = R[: wi + 1]  # clip rear wall at the reference terminus
+    F = ref_floor
+    if len(R) < 3 or len(F) < 3:
+        return None
+    fv = float(np.nanmedian(f_vel)) if np.isfinite(f_vel).any() else 0.5
+    if not np.isfinite(fv):
+        fv = 0.5
+    p_vel = _point_at_fraction(R, fv)
+    i_ru = _split_index(R, p_vel)
+    i_rf = _split_index(F, R[i_ru])
+    k_o = n + 2
+    k_p = (n + 1) if even_total else (n + 2)
+    go = _cavity_gridlines(R[: i_ru + 1], F[: i_rf + 1], k_o, recenter_iters)
+    gp = _cavity_gridlines(R[i_ru:], F[i_rf:], k_p, recenter_iters)
+    if go is None or gp is None:
+        return None
+    O = np.vstack([go[0], gp[0][1:]]).astype(np.float32)  # share the velum gridline
+    N = np.vstack([go[1], gp[1][1:]]).astype(np.float32)
+    return {"O": O, "N": N, "a_idx": anchor_indices(n, even_total)}
+
+
+def measure_fixed_grid(roof, floor, grid):
+    """Measure VTD for one frame against a FIXED grid: for each fixed gridline
+    (origin, normal), the airway width = distance between the roof and floor
+    crossings (straddle). Only the crossings move frame to frame; the gridlines are
+    fixed. Returns (vtd (L,), roof_pts (L,2), floor_pts (L,2), a_idx)."""
+    O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
+    L = len(O)
+    roof_pts = np.full((L, 2), np.nan, np.float32)
+    floor_pts = np.full((L, 2), np.nan, np.float32)
+    if roof is None or floor is None or len(roof) < 2 or len(floor) < 2:
+        return np.full(L, np.nan, np.float32), roof_pts, floor_pts, a_idx
+    R = np.asarray(roof, np.float32)
+    F = np.asarray(floor, np.float32)
+    for i in range(L):
+        roof_pts[i], floor_pts[i] = _straddle_hits(O[i], N[i], R, F)
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
@@ -1093,8 +1173,11 @@ def _utterance_anchors(regions, T, jaw_ref):
     return walls, f_vel, tb
 
 
-def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n):
-    """Single-frame VTD for the configured grid method using precomputed anchors."""
+def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None):
+    """Single-frame VTD for the configured grid method using precomputed anchors.
+    When `fixed_grid` is provided (grid_method='fixed'), measure against it."""
+    if fixed_grid is not None:
+        return measure_fixed_grid(roof, floor, fixed_grid)
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
@@ -1330,8 +1413,13 @@ def write_diagnostic_video(
     writer = cv2.VideoWriter(
         str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh)
     )
-    # Same anchors as the output (e.g. one firm median velum split for the clip).
+    # Same anchors/grid as the output (e.g. the fixed per-clip grid).
     walls, f_vel, tb = _utterance_anchors(regions, T, jaw_ref)
+    fixed_grid = (
+        build_fixed_grid(walls, f_vel, tb, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+        if GRID_METHOD == "fixed"
+        else None
+    )
     for t in range(T):
         mri = _mri_frame(cap, t, (mh, mw)) if cap is not None else None
         if mri is not None:
@@ -1344,7 +1432,7 @@ def write_diagnostic_video(
             canvas = np.full((fh, fw, 3), 20, np.uint8)
         roof, floor, vel_c = walls[t]
         _, r, f, a_idx = _grid_with_anchors(
-            roof, floor, vel_c, f_vel[t], tb[t], n_gridlines
+            roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid
         )
         _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
         writer.write(canvas)
@@ -1433,14 +1521,21 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         # Pass 1: trace walls + derive the velum split fraction and tongue-bottom,
         # per VELUM_ANCHOR (median = one firm fraction per clip) / ANCHOR_SMOOTH.
         walls, f_vel, tb = _utterance_anchors(regions, T, jaw_ref)
-        # Pass 2: compute VTD with the stabilized anchors.
+        # grid_method='fixed': build one fixed grid for the whole clip from the
+        # median walls; per frame only the boundary crossings move.
+        fixed_grid = (
+            build_fixed_grid(walls, f_vel, tb, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+            if GRID_METHOD == "fixed"
+            else None
+        )
+        # Pass 2: compute VTD with the stabilized anchors (or the fixed grid).
         vtd = np.full((T, L), np.nan, np.float32)
         roof_pts = np.full((T, L, 2), np.nan, np.float32)
         floor_pts = np.full((T, L, 2), np.nan, np.float32)
         for t in range(T):
             roof, floor, vel_c = walls[t]
             v, r, f, _ = _grid_with_anchors(
-                roof, floor, vel_c, f_vel[t], tb[t], n_gridlines
+                roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid
             )
             vtd[t], roof_pts[t], floor_pts[t] = v, r, f
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
@@ -1503,9 +1598,14 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     )
     ti = T // 2
     walls_d, f_vel_d, tb_d = _utterance_anchors(regions, T, jaw_ref)
+    fixed_grid_d = (
+        build_fixed_grid(walls_d, f_vel_d, tb_d, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+        if GRID_METHOD == "fixed"
+        else None
+    )
     roof, floor, vel_c = walls_d[ti]
     _, r, f, a_idx = _grid_with_anchors(
-        roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines
+        roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines, fixed_grid_d
     )
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
@@ -1578,9 +1678,10 @@ def main():
     )
     p.add_argument(
         "--grid-method",
-        choices=["arc", "midline"],
+        choices=["arc", "midline", "fixed"],
         default=GRID_METHOD,
-        help="arc = legacy index-to-index; midline = normal cross-sections.",
+        help="arc = legacy index-to-index; midline = per-frame perpendicular; "
+        "fixed = one grid per video from median walls (original-VTD style).",
     )
     p.add_argument(
         "--norm-method",
