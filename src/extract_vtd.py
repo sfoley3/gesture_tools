@@ -1248,8 +1248,12 @@ def _utterance_anchors(regions, T, jaw_ref):
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
         cont = {
+            # floor: raw tongue(+lip) contour — single blob, airway edge is clean and
+            # captures the curling back with no terminus landmark.
             "floor": _region_contours(reg_up, [TONGUE_SUB, LOWER_LIP_SUB]),
-            "roof": _region_contours(reg_up, [ROOF_FRONT_SUB, VELUM_SUB, PHARYNX_SUB]),
+            # roof: the TRACED build_roof line, which already bridges the velum->wall
+            # port with a straight span (no raw-contour curl around the velum flap).
+            "roof": [roof] if (roof is not None and len(roof) >= 2) else None,
         }
         walls.append((roof, floor, vel_c, cont))
         vcent = _velum_centroid(reg_up)
