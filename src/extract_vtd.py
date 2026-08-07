@@ -1581,7 +1581,10 @@ def write_diagnostic_video(
         _, r, f, a_idx = _grid_with_anchors(
             roof, floor, vel_c, f_vel[t], tb[t], n_gridlines, fixed_grid, cont
         )
-        _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, a_idx)
+        # Draw the actual boundary the points are measured against: in fixed mode the
+        # roof is the airway-boundary (bridged velum), not the build_roof curl.
+        roof_draw = cont["roof"][0] if (fixed_grid is not None and cont.get("roof")) else roof
+        _draw_overlay_bgr(canvas, regions, t, roof_draw, floor, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
         cap.release()
@@ -1754,12 +1757,13 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     _, r, f, a_idx = _grid_with_anchors(
         roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines, fixed_grid_d, cont
     )
+    roof_draw = cont["roof"][0] if (fixed_grid_d is not None and cont.get("roof")) else roof
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
         ti,
         vpath,
-        roof,
+        roof_draw,
         floor,
         r,
         f,
