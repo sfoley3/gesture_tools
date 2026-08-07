@@ -1032,16 +1032,12 @@ def midline_grid(
     R = np.asarray(roof, np.float32)
     F = np.asarray(floor, np.float32)
 
-    # Posterior clip: cut the rear wall at the tongue-bottom DEPTH (walk down the wall),
-    # so the grid never extends below where the tongue reaches — but keep the whole wall
-    # above that depth. Euclidean-nearest clipping would chop the wall off at a dipping
-    # velum (see build_fixed_grid), collapsing the pharyngeal cavity.
+    # Posterior clip: drop rear-wall points beyond the nearest point to the tongue
+    # bottom, so the grid never extends below where the tongue reaches (req 3).
     tb = None
     if tongue_bottom is not None and np.all(np.isfinite(tongue_bottom)):
         tb = np.asarray(tongue_bottom, np.float32)
-        y_t = float(tb[1])
-        below = np.where(R[:, 1] <= y_t + 1.0)[0]
-        wi = int(below.max()) if len(below) else int(((R - tb[None, :]) ** 2).sum(1).argmin())
+        wi = int(((R - tb[None, :]) ** 2).sum(1).argmin())
         if wi >= 2:
             R = R[: wi + 1]
     if len(R) < 3:
@@ -1113,22 +1109,9 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     )
     R = ref_roof
     if np.all(np.isfinite(ref_tb)):
-        # Clip the rear wall at the tongue-bottom DEPTH (walk DOWN the wall), NOT at the
-        # euclidean-nearest roof point. A dipping velum can be euclidean-closer to the
-        # tongue bottom than the far rear wall is, so nearest-point clipping chops the
-        # whole pharyngeal wall off — collapsing the pharyngeal cavity to a stub, so the
-        # posterior gridlines fan out from the velum and their roof ends land back on the
-        # palate. Taking the LAST roof point at/above the terminus depth keeps the wall
-        # down to where the tongue reaches.
-        y_t = float(ref_tb[1])
-        below = np.where(R[:, 1] <= y_t + 1.0)[0]
-        wi = (
-            int(below.max())
-            if len(below)
-            else int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
-        )
+        wi = int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
         if wi >= 2:
-            R = R[: wi + 1]  # clip rear wall at the reference terminus depth
+            R = R[: wi + 1]  # clip rear wall at the reference terminus
     F = ref_floor
     if len(R) < 3 or len(F) < 3:
         return None
@@ -1501,27 +1484,6 @@ def _mri_frame(cap, t, mask_hw):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
-def _clip_line_to_anchors(line, pts):
-    """Trim a drawn wall polyline to the span between the FIRST and LAST VTD connection
-    points in `pts` (first anchor = lips, last anchor = tongue back / rear wall), so
-    the wall is not drawn past the anchors actually measured — nothing before the lip
-    aperture at the front, and no roof/wall/tongue contour past the last connection at
-    the back."""
-    if line is None or pts is None or len(pts) < 1 or len(line) < 2:
-        return line
-    line = np.asarray(line, np.float32)
-    lo, hi = 0, len(line) - 1
-    p_first = np.asarray(pts[0], np.float32)
-    p_last = np.asarray(pts[-1], np.float32)
-    if np.all(np.isfinite(p_first)):
-        lo = int(((line - p_first[None, :]) ** 2).sum(1).argmin())
-    if np.all(np.isfinite(p_last)):
-        hi = int(((line - p_last[None, :]) ** 2).sum(1).argmin())
-    if lo > hi:
-        lo, hi = hi, lo
-    return line[lo : hi + 1] if (hi - lo) >= 1 else line
-
-
 def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=()):
     """Draw masks (translucent), wall lines and VTD grid+points onto a BGR
     canvas whose size is (mask * scale). Coordinates are in mask space. Anchor
@@ -1560,8 +1522,8 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=(
             )
             cv2.circle(canvas, p1, 3, _VTD_BGR, -1)
             cv2.circle(canvas, p2, 3, _VTD_BGR, -1)
-    _poly(_clip_line_to_anchors(roof, r), _ROOF_BGR)
-    _poly(_clip_line_to_anchors(floor, f), _FLOOR_BGR)
+    _poly(roof, _ROOF_BGR)
+    _poly(floor, _FLOOR_BGR)
     return canvas
 
 
@@ -1613,11 +1575,9 @@ def save_static_diagnostic(
                 [u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5, linewidths=0
             )
     if roof is not None:
-        roof_draw = _clip_line_to_anchors(roof, r)
-        ax.plot(roof_draw[:, 0], roof_draw[:, 1], color="lime", lw=1.8, zorder=4)
+        ax.plot(roof[:, 0], roof[:, 1], color="lime", lw=1.8, zorder=4)
     if floor is not None:
-        floor_draw = _clip_line_to_anchors(floor, f)
-        ax.plot(floor_draw[:, 0], floor_draw[:, 1], color="red", lw=1.8, zorder=4)
+        ax.plot(floor[:, 0], floor[:, 1], color="red", lw=1.8, zorder=4)
     ax.set_aspect("equal")
     ax.axis("off")
     fig.savefig(str(out_path), bbox_inches="tight", pad_inches=0)
