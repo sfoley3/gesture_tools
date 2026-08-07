@@ -104,6 +104,7 @@ _DEFAULT_CFG = {
     "velum_anchor": "median",  # {median, smooth} velum split: per-video median fraction (firm) vs per-frame smoothed
     "wall_bottom": "median",  # {median, smooth} pharyngeal-wall bottom (tongue-back terminus ref): firm vs smoothed
     "jump_thresh": {"frac": 0.15, "px": 10.0},  # anchor jump limits: velum fraction / position (px). carry-forward on jump or dropout
+    "fixed_window": 0.15,  # grid_method=fixed: arc-fraction window for the per-frame local floor-crossing search
     "session": None,  # session subdir for longitudinal data ({spk}/{session}/...); None = flat
 }
 
@@ -141,6 +142,7 @@ FLOOR_FRONT = str(_cfg.get("floor_front", "skyline"))
 VELUM_ANCHOR = str(_cfg.get("velum_anchor", "median"))
 WALL_BOTTOM = str(_cfg.get("wall_bottom", "median"))
 JUMP_THRESH = dict(_cfg.get("jump_thresh", {"frac": 0.15, "px": 10.0}))
+FIXED_WINDOW = float(_cfg.get("fixed_window", 0.15))
 MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
@@ -925,6 +927,32 @@ def _straddle_hits(origin, nrm, R, F):
     return rp.astype(np.float32), fp.astype(np.float32)
 
 
+def _frac_of(poly, cum, p):
+    """Arc-length fraction along `poly` of the vertex nearest point `p`."""
+    i = int(((poly - np.asarray(p, np.float32)[None, :]) ** 2).sum(1).argmin())
+    return float(cum[i] / cum[-1]) if cum[-1] > 0 else 0.5
+
+
+def _local_crossing(origin, nrm, poly, cum, s_ref, window):
+    """Crossing of the fixed gridline (origin, nrm) with `poly` that is nearest the
+    origin AND whose arc-length fraction is within `window` of the reference fraction
+    `s_ref`. Restricting to a local arc window stops a fixed gridline from grabbing a
+    far crossing on the other side of the tongue when the articulator has moved (the
+    'connector jumps to the tongue front' bug). Falls back to the reference location
+    on the polyline when the line misses locally."""
+    ts, pts = _line_crossings(origin, nrm, poly)
+    if pts is None:
+        return _point_at_fraction(poly, s_ref) if s_ref is not None else _nearest_on(poly, origin)
+    if s_ref is None:
+        return pts[0]
+    fr = np.array([_frac_of(poly, cum, p) for p in pts])
+    m = np.abs(fr - s_ref) <= window
+    if m.any():
+        idx = np.where(m)[0]
+        return pts[idx[np.abs(ts[idx]).argmin()]]
+    return _point_at_fraction(poly, s_ref)  # gridline missed locally -> reference spot
+
+
 def build_midline(roof, floor, recenter_iters=1, m=150, sigma=3.0):
     """Smooth centerline between the two walls, lips -> posterior terminus. A
     coarse arc-length average is medial-recentered (nearest point on each wall,
@@ -1091,7 +1119,14 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         return None
     O = np.vstack([go[0], gp[0][1:]]).astype(np.float32)  # share the velum gridline
     N = np.vstack([go[1], gp[1][1:]]).astype(np.float32)
-    return {"O": O, "N": N, "a_idx": anchor_indices(n, even_total)}
+    # Record where each gridline crosses the REFERENCE floor (arc-length fraction),
+    # so the per-frame search can stay local to that tongue location.
+    cumF = _cumarc(ref_floor)
+    sF = np.zeros(len(O), np.float32)
+    for i in range(len(O)):
+        _, fp = _straddle_hits(O[i], N[i], R, ref_floor)
+        sF[i] = _frac_of(ref_floor, cumF, fp)
+    return {"O": O, "N": N, "a_idx": anchor_indices(n, even_total), "sF": sF}
 
 
 def measure_fixed_grid(roof, floor, grid):
@@ -1100,6 +1135,7 @@ def measure_fixed_grid(roof, floor, grid):
     crossings (straddle). Only the crossings move frame to frame; the gridlines are
     fixed. Returns (vtd (L,), roof_pts (L,2), floor_pts (L,2), a_idx)."""
     O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
+    sF = grid.get("sF")
     L = len(O)
     roof_pts = np.full((L, 2), np.nan, np.float32)
     floor_pts = np.full((L, 2), np.nan, np.float32)
@@ -1107,8 +1143,15 @@ def measure_fixed_grid(roof, floor, grid):
         return np.full(L, np.nan, np.float32), roof_pts, floor_pts, a_idx
     R = np.asarray(roof, np.float32)
     F = np.asarray(floor, np.float32)
+    cumF = _cumarc(F)
     for i in range(L):
-        roof_pts[i], floor_pts[i] = _straddle_hits(O[i], N[i], R, F)
+        # roof: nearest crossing to the origin (rear wall / palate is well-behaved).
+        tsr, ptsr = _line_crossings(O[i], N[i], R)
+        roof_pts[i] = ptsr[0] if ptsr is not None else _nearest_on(R, O[i])
+        # floor: LOCAL crossing near this gridline's reference tongue position, so it
+        # cannot jump across the tongue to the front when the tongue has moved.
+        s_ref = float(sF[i]) if sF is not None else None
+        floor_pts[i] = _local_crossing(O[i], N[i], F, cumF, s_ref, FIXED_WINDOW)
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
@@ -1645,7 +1688,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 def main():
     global UPSCALE, PRE_SIGMA, SIGMA_PATH, EVEN_TOTAL
     global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS, SESSION, FLOOR_FRONT
-    global VELUM_ANCHOR, WALL_BOTTOM
+    global VELUM_ANCHOR, WALL_BOTTOM, FIXED_WINDOW
     single = not SPK_BASE
     p = argparse.ArgumentParser(
         description="Extract vocal-tract distance (VTD) from SAM2 masks."
@@ -1730,6 +1773,12 @@ def main():
         default=WALL_BOTTOM,
         help="pharyngeal-wall bottom (tongue-back terminus ref): median (firm) vs smoothed.",
     )
+    p.add_argument(
+        "--fixed-window",
+        type=float,
+        default=FIXED_WINDOW,
+        help="grid_method=fixed: arc-fraction window for the local floor-crossing search.",
+    )
     args = p.parse_args()
     UPSCALE, PRE_SIGMA, SIGMA_PATH = args.upscale, args.pre_sigma, args.sigma_path
     EVEN_TOTAL = args.parity == "even"
@@ -1740,6 +1789,7 @@ def main():
     FLOOR_FRONT = args.floor_front
     VELUM_ANCHOR = args.velum_anchor
     WALL_BOTTOM = args.wall_bottom
+    FIXED_WINDOW = args.fixed_window
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")
