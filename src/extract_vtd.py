@@ -522,7 +522,12 @@ def _tongue_backside(tongue_mask, w_low=None):
     a, b = sorted([root, end])
     arc1 = pts[a : b + 1]
     arc2 = np.concatenate([pts[b:], pts[: a + 1]])
-    arc = arc1 if arc1[:, 0].mean() >= arc2[:, 0].mean() else arc2  # posterior side
+    # Posterior backside = the root->terminus arc that does NOT wrap through the tongue
+    # TIP (left-most point). The tip-containing arc is the anterior/underside; excluding
+    # it reliably keeps the wall-facing edge and reaches the terminus even when it curls
+    # to low x (a mean-x test picks the wrong, short arc there and cuts the back off).
+    tip = int(pts[:, 0].argmin())
+    arc = arc2 if (a <= tip <= b) else arc1
     # Orient root -> terminus (robust to the terminus being above or below root).
     if ((arc[0] - pts[root]) ** 2).sum() > ((arc[-1] - pts[root]) ** 2).sum():
         arc = arc[::-1]
@@ -1113,20 +1118,14 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         ref_roof = np.nanmedian(np.stack(roofs, 0), axis=0).astype(np.float32)
         ref_floor = np.nanmedian(np.stack(floors, 0), axis=0).astype(np.float32)
     tb = np.asarray(tb, np.float32)
-    # FIXED per-file tongue-bottom anchor: the tongue point closest to the rear-wall
-    # bottom, medianed over the clip into ONE point. This is the hard stop for the
-    # pharyngeal cavity and the frozen last floor anchor — it replaces the noisy,
-    # sometimes-cut-short per-frame tongue tip.
+    # ref_tb: per-file median tongue-bottom (tongue point closest to the rear-wall
+    # bottom), used ONLY to clip the rear wall to the terminus depth. The per-frame
+    # terminus is NOT frozen — it tracks the tongue contour in measure_fixed_grid.
     ref_tb = (
         np.array([np.nanmedian(tb[:, 0]), np.nanmedian(tb[:, 1])], np.float32)
         if np.isfinite(tb).any()
         else ref_floor[-1]
     )
-    # Force the reference floor to END exactly at ref_tb so the cavity stops there.
-    if np.all(np.isfinite(ref_tb)) and len(ref_floor) >= 3:
-        j = int(((ref_floor - ref_tb[None, :]) ** 2).sum(1).argmin())
-        if j >= 2:
-            ref_floor = np.vstack([ref_floor[:j], ref_tb[None, :]]).astype(np.float32)
     R = ref_roof
     if np.all(np.isfinite(ref_tb)):
         wi = int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
@@ -1164,7 +1163,6 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         "a_idx": anchor_indices(n, even_total),
         "Rref": Rref,
         "Fref": Fref,
-        "ref_tb": ref_tb,  # fixed per-file tongue-bottom anchor (frozen terminus)
     }
 
 
@@ -1188,10 +1186,6 @@ def measure_fixed_grid(contours, grid):
         f_ref = Fref[i] if Fref is not None else O[i]
         roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
         floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
-    # Freeze the terminus floor point to the fixed per-file tongue-bottom anchor.
-    ref_tb = grid.get("ref_tb")
-    if ref_tb is not None and np.all(np.isfinite(ref_tb)):
-        floor_pts[-1] = np.asarray(ref_tb, np.float32)
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
