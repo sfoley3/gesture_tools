@@ -400,11 +400,13 @@ def _closest_pair(a, b):
     return i, int(idx[i])
 
 
-def build_roof(reg_up: dict):
+def build_roof(reg_up: dict, w_low=None):
     """One line, front -> back, in original coords:
       palate bottom edge  ->(spliced where they meet)->  velum bottom edge
       ->(bridge from velum bottom-right to closest wall point)->
-      pharyngeal-wall edge, DOWN only as far as the tongue reaches.
+      pharyngeal-wall edge, DOWN only as far as the tongue-back terminus reaches
+      (the last point connected to the tongue), using the SAME terminus the floor
+      uses so the rear-wall and tongue-back endpoints stay aligned.
     Returns (M,2) or None."""
     U = UPSCALE
     palate = reg_up.get(ROOF_FRONT_SUB)
@@ -449,10 +451,21 @@ def build_roof(reg_up: dict):
     if wall is not None:
         wl = _left_edge(wall)  # ascending y (top -> bottom)
         if len(wl) >= 2:
-            # Depth limit = the tongue's lowest extent (constriction region only;
-            # do NOT run to the bottom of the pharyngeal-wall mask).
+            # Depth limit = the tongue-back TERMINUS (the last point the tongue
+            # connects to), NOT the tongue mask's geometric max-y and NOT the
+            # bottom of the pharyngeal-wall mask. Using the same terminus the floor
+            # traces keeps the rear wall and the tongue-back anchor aligned, so a
+            # curled-under backside cannot leave the rear wall running past (or
+            # short of) where the tongue actually reaches.
+            y_limit = None
             if tongue is not None and tongue.any():
-                y_limit = float(np.where(tongue)[0].max())
+                bs = _tongue_backside(
+                    np.asarray(tongue).astype(np.uint8), _wall_bottom_up(reg_up, w_low)
+                )
+                if bs is not None and len(bs):
+                    y_limit = float(bs[-1, 1])  # terminus y (upscaled coords)
+                else:
+                    y_limit = float(np.where(tongue)[0].max())
             else:
                 y_limit = float(wl[:, 1].max())
             k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())  # velum junction
@@ -498,11 +511,16 @@ def _wall_bottom_up(reg_up, w_low=None):
 
 def _tongue_backside(tongue_mask, w_low=None):
     """Posterior/backside edge of the tongue: the contour arc from the right-most
-    point (root) to the tongue-contour point CLOSEST to the pharyngeal-wall bottom
-    `w_low` (the tongue's inferior-posterior corner). Terminating at that point —
-    rather than the tongue's own geometric max-y — is what lets the backside reach
-    the true bottom instead of being cut short: the descent past the wall-facing
-    corner curls to lower x, so an x-based cut deletes it. Falls back to the
+    point (root) to the tongue's inferior-posterior corner. The corner is the
+    contour point that reaches FARTHEST toward the pharyngeal-wall bottom `w_low`
+    measured as a PROJECTION along the root -> w_low axis (not raw
+    nearest-Euclidean). The projection is what makes the terminus robust to a
+    backside that curls under: the curled-under hook swings back toward the
+    root/velum, so it scores lower on the axis and cannot pull the terminus up —
+    whereas nearest-Euclidean can snap onto that hook and place the terminus near
+    the velum. Terminating at this corner (rather than the tongue's own geometric
+    max-y) also lets the backside reach the true bottom instead of being cut short
+    by the descent past the corner curling to lower x. Falls back to the
     bottom-most pixel when `w_low` is None. Taken on the higher-x (wall-facing)
     side, oriented root -> terminus. Returns (K,2) upscaled or None."""
     core = _largest_component(tongue_mask.astype(bool)).astype(np.uint8)
@@ -514,7 +532,14 @@ def _tongue_backside(tongue_mask, w_low=None):
         return None
     root = int(pts[:, 0].argmax())  # right-most (tongue root)
     if w_low is not None:
-        end = int(((pts - np.asarray(w_low, np.float32)[None, :]) ** 2).sum(1).argmin())
+        root_pt = pts[root].astype(np.float32)
+        axis = np.asarray(w_low, np.float32) - root_pt  # root -> wall-bottom direction
+        norm = float(np.hypot(axis[0], axis[1]))
+        if norm > 1e-6:
+            proj = ((pts.astype(np.float32) - root_pt[None, :]) * (axis / norm)[None, :]).sum(1)
+            end = int(proj.argmax())  # farthest along the axis = inferior-posterior corner
+        else:
+            end = int(((pts - np.asarray(w_low, np.float32)[None, :]) ** 2).sum(1).argmin())
     else:
         end = int(pts[:, 1].argmax())  # fallback: bottom-most pixel
     if root == end:
@@ -1422,7 +1447,7 @@ def _frame_walls(regions, t, jaw_ref, w_low=None):
         reg_up[sub] = smooth_mask(m[t]) if (m is not None and t < m.shape[0]) else None
     jaw_up = (jaw_ref[0] * UPSCALE, jaw_ref[1] * UPSCALE) if jaw_ref else None
     return (
-        build_roof(reg_up),
+        build_roof(reg_up, w_low=w_low),
         build_floor(reg_up, jaw_up, w_low=w_low),
         _velum_lower_center(reg_up),
         reg_up,
