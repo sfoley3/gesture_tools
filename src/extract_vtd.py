@@ -1464,7 +1464,20 @@ def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, co
     When `fixed_grid` is provided (grid_method='fixed'), measure both walls against
     the raw mask contours."""
     if fixed_grid is not None:
-        return measure_fixed_grid(contours, fixed_grid)
+        vtd, r, f, a_idx = measure_fixed_grid(contours, fixed_grid)
+        # GUARANTEE the tongue-back anchor connects the tongue back to the rear wall.
+        # `build_roof` ends on the rear wall exactly at the tongue-back connection and
+        # `build_floor` ends at the tongue back (a mutual-closest tongue/wall pair), so
+        # pin the last anchor to those two endpoints. A curled-under backside bends
+        # away from the wall and can never be that pair, so the anchor can never float
+        # off the rear wall. This also drives `_trim_roof_to_last`, so the drawn rear
+        # wall stops at the connection (not the wall bottom).
+        if roof is not None and floor is not None and len(roof) >= 1 and len(floor) >= 1:
+            k = a_idx[-1]
+            r[k] = np.asarray(roof[-1], np.float32)
+            f[k] = np.asarray(floor[-1], np.float32)
+            vtd[k] = float(np.linalg.norm(r[k] - f[k]))
+        return vtd, r, f, a_idx
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
