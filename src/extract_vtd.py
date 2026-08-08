@@ -1488,6 +1488,26 @@ def _mri_frame(cap, t, mask_hw):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
+def _clip_roof_to_anchors(roof, r):
+    """Trim the drawn ROOF polyline to the span between its first and last VTD points
+    (`r[0]` = upper-lip anchor, `r[-1]` = last gridline), so the rear wall is not drawn
+    below the last gridline and the palate/lip is not drawn ahead of the lip anchor.
+    Floor is left untrimmed (it already ends at the tongue-bottom terminus)."""
+    if roof is None or r is None or len(r) < 1 or len(roof) < 2:
+        return roof
+    roof = np.asarray(roof, np.float32)
+    lo, hi = 0, len(roof) - 1
+    p_first = np.asarray(r[0], np.float32)
+    p_last = np.asarray(r[-1], np.float32)
+    if np.all(np.isfinite(p_first)):
+        lo = int(((roof - p_first[None, :]) ** 2).sum(1).argmin())
+    if np.all(np.isfinite(p_last)):
+        hi = int(((roof - p_last[None, :]) ** 2).sum(1).argmin())
+    if lo > hi:
+        lo, hi = hi, lo
+    return roof[lo : hi + 1] if (hi - lo) >= 1 else roof
+
+
 def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=()):
     """Draw masks (translucent), wall lines and VTD grid+points onto a BGR
     canvas whose size is (mask * scale). Coordinates are in mask space. Anchor
@@ -1526,7 +1546,7 @@ def _draw_overlay_bgr(canvas, regions, t, roof, floor, r, f, scale, anchor_idx=(
             )
             cv2.circle(canvas, p1, 3, _VTD_BGR, -1)
             cv2.circle(canvas, p2, 3, _VTD_BGR, -1)
-    _poly(roof, _ROOF_BGR)
+    _poly(_clip_roof_to_anchors(roof, r), _ROOF_BGR)
     _poly(floor, _FLOOR_BGR)
     return canvas
 
@@ -1579,7 +1599,8 @@ def save_static_diagnostic(
                 [u[0], l[0]], [u[1], l[1]], s=8, color="yellow", zorder=5, linewidths=0
             )
     if roof is not None:
-        ax.plot(roof[:, 0], roof[:, 1], color="lime", lw=1.8, zorder=4)
+        roof_draw = _clip_roof_to_anchors(roof, r)
+        ax.plot(roof_draw[:, 0], roof_draw[:, 1], color="lime", lw=1.8, zorder=4)
     if floor is not None:
         ax.plot(floor[:, 0], floor[:, 1], color="red", lw=1.8, zorder=4)
     ax.set_aspect("equal")
