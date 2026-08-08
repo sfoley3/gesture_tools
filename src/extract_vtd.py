@@ -1147,17 +1147,18 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     }
 
 
-def measure_fixed_grid(contours, grid):
-    """Measure VTD for one frame against a FIXED grid. BOTH walls are measured the
-    same way: for each fixed gridline, the raw-mask-contour crossing nearest that
-    gridline's REFERENCE point (Rref for the roof, Fref for the floor). The reference
-    points are set ONCE in `build_fixed_grid` from the clean per-file median geometry,
-    so for the posterior gridlines Rref sits on the rear wall — anchoring to it is what
-    makes the roof point snap to the rear-wall crossing and never the palate, even
-    though both belong to the same roof polyline. No traced polyline, no terminus, no
-    arc — so neither a curving tongue back nor a shortening upper-lip contour makes a
-    connector snap. VTD = distance between the two crossings. Returns
-    (vtd (L,), roof_pts, floor_pts, a_idx)."""
+def measure_fixed_grid(contours, grid, tb=None):
+    """Measure VTD for one frame against a FIXED grid. Interior gridlines: for each
+    fixed gridline, the raw-mask-contour crossing nearest that gridline's REFERENCE
+    point (Rref for the roof, Fref for the floor), set once in `build_fixed_grid`.
+
+    POSTERIOR TERMINUS anchor (the last line) is defined directly, not from a gridline
+    crossing: the floor point is the tongue bottom `tb` — the tongue point closest to
+    the rear-wall bottom (the END of the tongue backside contour), stabilized per file —
+    and the roof point is the CLOSEST point on the roof to it, which is the rear wall
+    right beside it. Using the true tongue bottom (not the grid's last crossing) is what
+    stops the roof end from snapping up to the palate. VTD = distance between the two
+    crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
     O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
     Rref, Fref = grid.get("Rref"), grid.get("Fref")
     L = len(O)
@@ -1170,6 +1171,16 @@ def measure_fixed_grid(contours, grid):
         f_ref = Fref[i] if Fref is not None else O[i]
         roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
         floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
+    # Posterior terminus: tongue bottom -> closest roof point (the rear wall next to it).
+    if (
+        tb is not None
+        and np.all(np.isfinite(tb))
+        and rc
+        and rc[0] is not None
+        and len(rc[0]) >= 1
+    ):
+        floor_pts[-1] = np.asarray(tb, np.float32)
+        roof_pts[-1] = _nearest_on(rc[0], floor_pts[-1])
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
@@ -1383,7 +1394,7 @@ def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, co
     When `fixed_grid` is provided (grid_method='fixed'), measure both walls against
     the raw mask contours."""
     if fixed_grid is not None:
-        return measure_fixed_grid(contours, fixed_grid)
+        return measure_fixed_grid(contours, fixed_grid, tb_t)
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
