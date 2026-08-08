@@ -1116,6 +1116,11 @@ def build_fixed_grid(walls, f_vel, tb, f_tb, n, even_total=False, recenter_iters
     # past the tongue-back anchor, and always land on the rear wall. Falls back to the
     # median tongue-bottom point only if the ratio is unavailable.
     ftb = float(f_tb) if (f_tb is not None and np.isfinite(f_tb)) else None
+    print(
+        f"    [build_fixed_grid] NEW anchor code active | fv={fv:.3f} "
+        f"f_tb={('%.3f' % ftb) if ftb is not None else 'NaN->FALLBACK to old clip'}",
+        file=sys.stderr,
+    )
     if ftb is not None:
         i_v = _split_index(R, p_vel)
         i_tb = _split_index(R, _point_at_fraction(R, ftb))
