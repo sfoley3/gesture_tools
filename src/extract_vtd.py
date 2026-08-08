@@ -984,13 +984,24 @@ def _cavity_gridlines(roof_seg, floor_seg, k, recenter_iters=1):
     mid = build_midline(R, F, recenter_iters)
     if mid is None or len(mid) < 2:
         return None
-    G = _resample(mid, k)
-    if G is None or len(G) != k:
+    # Origins: k stations spaced evenly along the midline. Normals: the LOCAL tangent
+    # sampled from the DENSE, smoothed midline (not a finite difference of the few coarse
+    # stations, whose one-sided ends and long chords give erratic per-line angles). This
+    # makes adjacent gridlines vary smoothly and stay cleanly perpendicular.
+    cum = _cumarc(mid)
+    total = float(cum[-1])
+    if total <= 0:
         return None
+    tang = np.gradient(mid.astype(np.float32), axis=0)
+    tang[:, 0] = gaussian_filter1d(tang[:, 0], sigma=3.0, mode="nearest")
+    tang[:, 1] = gaussian_filter1d(tang[:, 1], sigma=3.0, mode="nearest")
+    s = np.linspace(0.0, total, k)
+    G = np.stack([np.interp(s, cum, mid[:, 0]), np.interp(s, cum, mid[:, 1])], 1)
+    Tx = np.interp(s, cum, tang[:, 0])
+    Ty = np.interp(s, cum, tang[:, 1])
     N = np.zeros((k, 2), np.float32)
     for i in range(k):
-        tang = G[min(k - 1, i + 1)] - G[max(0, i - 1)]
-        nrm = np.array([-tang[1], tang[0]], np.float32)
+        nrm = np.array([-Ty[i], Tx[i]], np.float32)
         ln = float(np.linalg.norm(nrm))
         N[i] = nrm / ln if ln > 1e-6 else np.array([0.0, 1.0], np.float32)
     return G.astype(np.float32), N
@@ -1102,11 +1113,20 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         ref_roof = np.nanmedian(np.stack(roofs, 0), axis=0).astype(np.float32)
         ref_floor = np.nanmedian(np.stack(floors, 0), axis=0).astype(np.float32)
     tb = np.asarray(tb, np.float32)
+    # FIXED per-file tongue-bottom anchor: the tongue point closest to the rear-wall
+    # bottom, medianed over the clip into ONE point. This is the hard stop for the
+    # pharyngeal cavity and the frozen last floor anchor — it replaces the noisy,
+    # sometimes-cut-short per-frame tongue tip.
     ref_tb = (
         np.array([np.nanmedian(tb[:, 0]), np.nanmedian(tb[:, 1])], np.float32)
         if np.isfinite(tb).any()
         else ref_floor[-1]
     )
+    # Force the reference floor to END exactly at ref_tb so the cavity stops there.
+    if np.all(np.isfinite(ref_tb)) and len(ref_floor) >= 3:
+        j = int(((ref_floor - ref_tb[None, :]) ** 2).sum(1).argmin())
+        if j >= 2:
+            ref_floor = np.vstack([ref_floor[:j], ref_tb[None, :]]).astype(np.float32)
     R = ref_roof
     if np.all(np.isfinite(ref_tb)):
         wi = int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
@@ -1144,6 +1164,7 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
         "a_idx": anchor_indices(n, even_total),
         "Rref": Rref,
         "Fref": Fref,
+        "ref_tb": ref_tb,  # fixed per-file tongue-bottom anchor (frozen terminus)
     }
 
 
@@ -1167,6 +1188,10 @@ def measure_fixed_grid(contours, grid):
         f_ref = Fref[i] if Fref is not None else O[i]
         roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
         floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
+    # Freeze the terminus floor point to the fixed per-file tongue-bottom anchor.
+    ref_tb = grid.get("ref_tb")
+    if ref_tb is not None and np.all(np.isfinite(ref_tb)):
+        floor_pts[-1] = np.asarray(ref_tb, np.float32)
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
