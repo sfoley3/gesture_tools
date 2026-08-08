@@ -259,6 +259,30 @@ def _trim_wall_bottom(pts: np.ndarray) -> np.ndarray:
     return pts if cut < 2 else pts[:cut]
 
 
+def _trim_tongue_curl(arc: np.ndarray, tol: float = 1.0) -> np.ndarray:
+    """Strip a curled-under tail from the tongue backside.
+
+    `arc` is oriented root -> terminus in image coords (y increases DOWNWARD). A
+    healthy backside descends the posterior edge to the tongue's inferior-posterior
+    corner (y non-decreasing, possibly curling to lower x at the same depth — which
+    is why an x-based cut is wrong here). A curl-under instead REVERSES past the
+    corner and runs back UP under the tongue body, toward the velum. Keep the arc
+    through its deepest point, then cut the trailing run as soon as it climbs back
+    up by more than `tol` px. Clean backsides are unaffected (nothing trails the
+    deepest point); a curled backside is cut at the corner so the terminus — and
+    the rear-wall depth tied to it — stop where the tongue truly reaches."""
+    if arc is None or len(arc) < 3:
+        return arc
+    deep = int(np.argmax(arc[:, 1]))  # deepest (bottom corner)
+    y_deep = float(arc[deep, 1])
+    cut = len(arc)
+    for i in range(deep + 1, len(arc)):
+        if float(arc[i, 1]) < y_deep - tol:  # climbing back up => curl-under
+            cut = i
+            break
+    return arc if cut < 2 else arc[:cut]
+
+
 def _bridge(p1, p2, spacing=1.0):
     """Interior points of a straight line between p1 and p2 (~spacing apart)."""
     d = float(np.linalg.norm(p2 - p1))
@@ -551,6 +575,8 @@ def _tongue_backside(tongue_mask, w_low=None):
     # Orient root -> terminus (robust to the terminus being above or below root).
     if ((arc[0] - pts[root]) ** 2).sum() > ((arc[-1] - pts[root]) ** 2).sum():
         arc = arc[::-1]
+    # Drop any curled-under tail so the backside ends at the true bottom corner.
+    arc = _trim_tongue_curl(arc.astype(np.float32))
     return arc.astype(np.float32)
 
 
