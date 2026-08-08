@@ -1147,18 +1147,14 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     }
 
 
-def measure_fixed_grid(contours, grid, tb=None):
-    """Measure VTD for one frame against a FIXED grid. Interior gridlines: for each
-    fixed gridline, the raw-mask-contour crossing nearest that gridline's REFERENCE
-    point (Rref for the roof, Fref for the floor), set once in `build_fixed_grid`.
-
-    POSTERIOR TERMINUS anchor (the last line) is defined directly, not from a gridline
-    crossing: the floor point is the tongue bottom `tb` — the tongue point closest to
-    the rear-wall bottom (the END of the tongue backside contour), stabilized per file —
-    and the roof point is the CLOSEST point on the roof to it, which is the rear wall
-    right beside it. Using the true tongue bottom (not the grid's last crossing) is what
-    stops the roof end from snapping up to the palate. VTD = distance between the two
-    crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
+def measure_fixed_grid(contours, grid):
+    """Measure VTD for one frame against a FIXED grid. For each fixed gridline (both
+    cavities, terminus included), the raw-mask-contour crossing nearest that gridline's
+    REFERENCE point (Rref for the roof, Fref for the floor), set once in
+    `build_fixed_grid` from the clean per-file median geometry. Now that the pharyngeal
+    cavity is bounded at the tongue bottom (see `_floor_airway`), the last evenly-spaced
+    gridline already lands at the terminus, so there is no special-cased anchor. VTD =
+    distance between the two crossings. Returns (vtd (L,), roof_pts, floor_pts, a_idx)."""
     O, N, a_idx = grid["O"], grid["N"], grid["a_idx"]
     Rref, Fref = grid.get("Rref"), grid.get("Fref")
     L = len(O)
@@ -1171,16 +1167,6 @@ def measure_fixed_grid(contours, grid, tb=None):
         f_ref = Fref[i] if Fref is not None else O[i]
         roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
         floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
-    # Posterior terminus: tongue bottom -> closest roof point (the rear wall next to it).
-    if (
-        tb is not None
-        and np.all(np.isfinite(tb))
-        and rc
-        and rc[0] is not None
-        and len(rc[0]) >= 1
-    ):
-        floor_pts[-1] = np.asarray(tb, np.float32)
-        roof_pts[-1] = _nearest_on(rc[0], floor_pts[-1])
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
@@ -1245,14 +1231,19 @@ def _roof_airway(reg_up):
     return _smooth_path(line, SIGMA_PATH)
 
 
-def _floor_airway(reg_up):
+def _floor_airway(reg_up, w_low=None):
     """Airway-facing floor boundary — the floor twin of `_roof_airway`: the smooth
     UPPER ENVELOPE of the tongue(+lower-lip) from the lip aperture back to the tongue
     root, then the tongue backside for the curl. The upper envelope (per-column top of
     the tongue|lip union) traces the real lip edge and is single-valued in x, so it is
     smooth across the lip -> tongue front, never dips under the tongue, and its cross-
     connectors can't cross there — while the backside still captures the curling tongue
-    back. One open polyline in original coords, or None."""
+    back. One open polyline in original coords, or None.
+
+    The backside TERMINATES at the tongue point closest to the pharyngeal-wall bottom
+    `w_low` (same as `build_floor`), i.e. the terminus anchor `tb` — NOT the tongue's
+    max-y pixel. This bounds the pharyngeal cavity at the true terminus, so the fixed
+    grid's evenly-spaced stations don't overshoot below the tongue bottom."""
     tongue = reg_up.get(TONGUE_SUB)
     if tongue is None or not np.asarray(tongue).any():
         return None
@@ -1287,7 +1278,9 @@ def _floor_airway(reg_up):
             elif not np.allclose(front[0], ap):
                 front = np.vstack([ap[None, :], front])
     parts = [front]
-    backside = _tongue_backside(tb.astype(np.uint8), None)  # root -> tongue bottom curl
+    backside = _tongue_backside(
+        tb.astype(np.uint8), _wall_bottom_up(reg_up, w_low)
+    )  # root -> tongue point closest to the rear-wall bottom (= terminus tb)
     if backside is not None and len(backside) >= 1:
         parts.append(backside[1:] if len(backside) > 1 else backside)  # drop dup root
     line = np.concatenate(parts, axis=0) / UPSCALE
@@ -1360,7 +1353,7 @@ def _utterance_anchors(regions, T, jaw_ref):
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
         ra = _roof_airway(reg_up)
-        fa = _floor_airway(reg_up)
+        fa = _floor_airway(reg_up, w_low=w_low_s[t])
         cont = {
             # floor: dedicated airway boundary — smooth UPPER ENVELOPE of tongue(+lip)
             # from the lip aperture to the root (no dip under, no cross at the tongue
@@ -1394,7 +1387,7 @@ def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, co
     When `fixed_grid` is provided (grid_method='fixed'), measure both walls against
     the raw mask contours."""
     if fixed_grid is not None:
-        return measure_fixed_grid(contours, fixed_grid, tb_t)
+        return measure_fixed_grid(contours, fixed_grid)
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
