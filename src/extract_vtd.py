@@ -259,30 +259,6 @@ def _trim_wall_bottom(pts: np.ndarray) -> np.ndarray:
     return pts if cut < 2 else pts[:cut]
 
 
-def _trim_tongue_curl(arc: np.ndarray, tol: float = 1.0) -> np.ndarray:
-    """Strip a curled-under tail from the tongue backside.
-
-    `arc` is oriented root -> terminus in image coords (y increases DOWNWARD). A
-    healthy backside descends the posterior edge to the tongue's inferior-posterior
-    corner (y non-decreasing, possibly curling to lower x at the same depth — which
-    is why an x-based cut is wrong here). A curl-under instead REVERSES past the
-    corner and runs back UP under the tongue body, toward the velum. Keep the arc
-    through its deepest point, then cut the trailing run as soon as it climbs back
-    up by more than `tol` px. Clean backsides are unaffected (nothing trails the
-    deepest point); a curled backside is cut at the corner so the terminus — and
-    the rear-wall depth tied to it — stop where the tongue truly reaches."""
-    if arc is None or len(arc) < 3:
-        return arc
-    deep = int(np.argmax(arc[:, 1]))  # deepest (bottom corner)
-    y_deep = float(arc[deep, 1])
-    cut = len(arc)
-    for i in range(deep + 1, len(arc)):
-        if float(arc[i, 1]) < y_deep - tol:  # climbing back up => curl-under
-            cut = i
-            break
-    return arc if cut < 2 else arc[:cut]
-
-
 def _bridge(p1, p2, spacing=1.0):
     """Interior points of a straight line between p1 and p2 (~spacing apart)."""
     d = float(np.linalg.norm(p2 - p1))
@@ -424,13 +400,11 @@ def _closest_pair(a, b):
     return i, int(idx[i])
 
 
-def build_roof(reg_up: dict, w_low=None):
+def build_roof(reg_up: dict):
     """One line, front -> back, in original coords:
       palate bottom edge  ->(spliced where they meet)->  velum bottom edge
       ->(bridge from velum bottom-right to closest wall point)->
-      pharyngeal-wall edge, DOWN only as far as the tongue-back terminus reaches
-      (the last point connected to the tongue), using the SAME terminus the floor
-      uses so the rear-wall and tongue-back endpoints stay aligned.
+      pharyngeal-wall edge, DOWN only as far as the tongue reaches.
     Returns (M,2) or None."""
     U = UPSCALE
     palate = reg_up.get(ROOF_FRONT_SUB)
@@ -475,24 +449,16 @@ def build_roof(reg_up: dict, w_low=None):
     if wall is not None:
         wl = _left_edge(wall)  # ascending y (top -> bottom)
         if len(wl) >= 2:
-            k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())  # velum junction
-            # INVARIANT: the rear wall ALWAYS runs down to the wall point that the
-            # tongue-back anchor connects to, so the tongue back can never fail to
-            # meet the rear wall. `wall_pt` is the wall point of the mutual-closest
-            # (tongue-back, rear-wall) pair; end the wall exactly there.
-            _tp, wall_pt = _tongue_back_anchor(reg_up, w_low)
-            if wall_pt is not None:
-                j = int(((wl - wall_pt[None, :]) ** 2).sum(1).argmin())
-            elif tongue is not None and tongue.any():
+            # Depth limit = the tongue's lowest extent (constriction region only;
+            # do NOT run to the bottom of the pharyngeal-wall mask).
+            if tongue is not None and tongue.any():
                 y_limit = float(np.where(tongue)[0].max())
-                j = int(np.abs(wl[:, 1] - y_limit).argmin())
             else:
-                j = len(wl) - 1
-            lo, hi = (k, j) if k <= j else (j, k)
-            seg = wl[lo : hi + 1]
+                y_limit = float(wl[:, 1].max())
+            k = int(((wl - tail[None, :]) ** 2).sum(1).argmin())  # velum junction
+            seg = wl[k:]
+            seg = seg[seg[:, 1] <= y_limit]
             if len(seg) >= 1:
-                if seg[0, 1] > seg[-1, 1]:  # order velum(top) -> tongue connection(down)
-                    seg = seg[::-1]
                 br = _bridge(tail, seg[0])
                 if len(br):
                     parts.append(br)
@@ -532,16 +498,11 @@ def _wall_bottom_up(reg_up, w_low=None):
 
 def _tongue_backside(tongue_mask, w_low=None):
     """Posterior/backside edge of the tongue: the contour arc from the right-most
-    point (root) to the tongue's inferior-posterior corner. The corner is the
-    contour point that reaches FARTHEST toward the pharyngeal-wall bottom `w_low`
-    measured as a PROJECTION along the root -> w_low axis (not raw
-    nearest-Euclidean). The projection is what makes the terminus robust to a
-    backside that curls under: the curled-under hook swings back toward the
-    root/velum, so it scores lower on the axis and cannot pull the terminus up —
-    whereas nearest-Euclidean can snap onto that hook and place the terminus near
-    the velum. Terminating at this corner (rather than the tongue's own geometric
-    max-y) also lets the backside reach the true bottom instead of being cut short
-    by the descent past the corner curling to lower x. Falls back to the
+    point (root) to the tongue-contour point CLOSEST to the pharyngeal-wall bottom
+    `w_low` (the tongue's inferior-posterior corner). Terminating at that point —
+    rather than the tongue's own geometric max-y — is what lets the backside reach
+    the true bottom instead of being cut short: the descent past the wall-facing
+    corner curls to lower x, so an x-based cut deletes it. Falls back to the
     bottom-most pixel when `w_low` is None. Taken on the higher-x (wall-facing)
     side, oriented root -> terminus. Returns (K,2) upscaled or None."""
     core = _largest_component(tongue_mask.astype(bool)).astype(np.uint8)
@@ -553,14 +514,7 @@ def _tongue_backside(tongue_mask, w_low=None):
         return None
     root = int(pts[:, 0].argmax())  # right-most (tongue root)
     if w_low is not None:
-        root_pt = pts[root].astype(np.float32)
-        axis = np.asarray(w_low, np.float32) - root_pt  # root -> wall-bottom direction
-        norm = float(np.hypot(axis[0], axis[1]))
-        if norm > 1e-6:
-            proj = ((pts.astype(np.float32) - root_pt[None, :]) * (axis / norm)[None, :]).sum(1)
-            end = int(proj.argmax())  # farthest along the axis = inferior-posterior corner
-        else:
-            end = int(((pts - np.asarray(w_low, np.float32)[None, :]) ** 2).sum(1).argmin())
+        end = int(((pts - np.asarray(w_low, np.float32)[None, :]) ** 2).sum(1).argmin())
     else:
         end = int(pts[:, 1].argmax())  # fallback: bottom-most pixel
     if root == end:
@@ -572,35 +526,7 @@ def _tongue_backside(tongue_mask, w_low=None):
     # Orient root -> terminus (robust to the terminus being above or below root).
     if ((arc[0] - pts[root]) ** 2).sum() > ((arc[-1] - pts[root]) ** 2).sum():
         arc = arc[::-1]
-    # Drop any curled-under tail so the backside ends at the true bottom corner.
-    arc = _trim_tongue_curl(arc.astype(np.float32))
     return arc.astype(np.float32)
-
-
-def _tongue_back_anchor(reg_up, w_low=None):
-    """The tongue-back anchor connection, GUARANTEED to join the tongue back to the
-    pharyngeal (rear) wall. Returns (tongue_pt, wall_pt) in UPSCALED coords: the
-    mutual-closest pair between the tongue backside arc and the rear-wall airway
-    edge. The tongue endpoint is the backside point nearest the wall; the wall
-    endpoint is the wall point nearest that. A curled-under backside curls anterior,
-    AWAY from the wall, so it is never the closest point — the anchor lands on the
-    real tongue-back/rear-wall junction regardless of the curl. Returns
-    (tongue_pt, None) when there is no wall mask, (None, None) with no tongue."""
-    tongue = reg_up.get(TONGUE_SUB)
-    if tongue is None or not np.asarray(tongue).any():
-        return None, None
-    arc = _tongue_backside(np.asarray(tongue).astype(np.uint8), _wall_bottom_up(reg_up, w_low))
-    if arc is None or len(arc) == 0:
-        return None, None
-    wall = reg_up.get(PHARYNX_SUB)
-    if wall is None or not np.asarray(wall).any():
-        return arc[-1].astype(np.float32), None
-    wl = _left_edge(np.asarray(wall).astype(np.uint8))  # rear-wall airway edge
-    if wl is None or len(wl) == 0:
-        return arc[-1].astype(np.float32), None
-    d, idx = cKDTree(wl).query(arc)  # nearest wall point per backside point
-    i = int(d.argmin())  # backside point that is closest to the wall
-    return arc[i].astype(np.float32), wl[int(idx[i])].astype(np.float32)
 
 
 def _tongue_dorsum(mask_up, jaw_ref_up=None):
@@ -689,10 +615,6 @@ def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
         tongue, _wall_bottom_up(reg_up, w_low)
     )  # root -> terminus
     if backside is not None and len(backside) >= 1:
-        tongue_pt, _wall_pt = _tongue_back_anchor(reg_up, w_low)
-        if tongue_pt is not None and len(backside) >= 2:
-            i = int(((backside - tongue_pt[None, :]) ** 2).sum(1).argmin())
-            backside = backside[: i + 1]  # end at the rear-wall connection point
         parts.append(backside[1:] if len(backside) > 1 else backside)  # drop dup root
 
     line = np.concatenate(parts, axis=0) / UPSCALE
@@ -746,15 +668,12 @@ def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None):
             front = np.vstack([aperture[None, :], front])
     parts = [front]
 
-    # Tongue backside: trace from the root down to the tongue point that connects to
-    # the rear wall (the tongue side of the mutual-closest tongue/wall pair), so the
-    # floor's posterior end IS the tongue-back anchor and always meets the rear wall.
+    # Tongue backside: trace from the root all the way to the tongue-contour point
+    # closest to the pharyngeal-wall bottom (its inferior-posterior corner), so it
+    # reaches the true bottom instead of being cut short. That terminus is also the
+    # posterior VTD anchor, keeping the tongue-back and rear-wall endpoints aligned.
     backside = _tongue_backside(tongue, _wall_bottom_up(reg_up, w_low))
     if backside is not None and len(backside) >= 1:
-        tongue_pt, _wall_pt = _tongue_back_anchor(reg_up, w_low)
-        if tongue_pt is not None and len(backside) >= 2:
-            i = int(((backside - tongue_pt[None, :]) ** 2).sum(1).argmin())
-            backside = backside[: i + 1]  # end at the rear-wall connection point
         parts.append(backside)
 
     line = np.concatenate(parts, axis=0) / U
@@ -1155,7 +1074,7 @@ def midline_grid(
     return vtd, roof_pts, floor_pts, a_idx
 
 
-def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=200):
+def build_fixed_grid(walls, f_vel, tb, f_tb, n, even_total=False, recenter_iters=1, m=200):
     """Build ONE fixed grid for the whole clip (original-VTD style). The reference
     roof and floor are the per-point MEDIAN of the traced walls over all frames;
     split at the median velum fraction into oral/pharyngeal cavities; lay fixed
@@ -1182,12 +1101,6 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     with np.errstate(invalid="ignore"):
         ref_roof = np.nanmedian(np.stack(roofs, 0), axis=0).astype(np.float32)
         ref_floor = np.nanmedian(np.stack(floors, 0), axis=0).astype(np.float32)
-    tb = np.asarray(tb, np.float32)
-    ref_tb = (
-        np.array([np.nanmedian(tb[:, 0]), np.nanmedian(tb[:, 1])], np.float32)
-        if np.isfinite(tb).any()
-        else ref_floor[-1]
-    )
     R = ref_roof
     F = ref_floor
     if len(R) < 3 or len(F) < 3:
@@ -1195,22 +1108,32 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     fv = float(np.nanmedian(f_vel)) if np.isfinite(f_vel).any() else 0.5
     if not np.isfinite(fv):
         fv = 0.5
-    # Clip the rear wall at the wall point that connects to the tongue back, so the
-    # tongue-back anchor ALWAYS meets the rear wall. Search ONLY the post-velum
-    # rear-wall portion of R for the connection: this makes it impossible for the
-    # clip to land on the velum/palate (the failure that leaves the rear wall
-    # untraced and the anchor floating near the velum when the backside curls
-    # under). A curled-under terminus bends anterior, away from the wall, but the
-    # nearest REAR-WALL point is still the true tongue-back/rear-wall junction.
-    i_vel = _split_index(R, _point_at_fraction(R, fv))  # velum split on the rear wall
-    term = ref_tb if np.all(np.isfinite(ref_tb)) else F[-1]
-    rear = R[i_vel:]
-    if len(rear) >= 1 and np.all(np.isfinite(term)):
-        wi = i_vel + int(((rear - term[None, :]) ** 2).sum(1).argmin())
-        if wi >= 2:
-            R = R[: wi + 1]  # rear wall ends exactly at the tongue-back connection
-    p_vel = _point_at_fraction(R, fv)
-    i_ru = _split_index(R, p_vel)
+    p_vel = _point_at_fraction(R, fv)  # velum point on the FULL rear wall
+
+    # Tongue-back anchor = a FIRM per-clip arc RATIO along the rear wall (exactly like
+    # the velum fraction). Clip the rear wall at that ratio, so the pharyngeal cavity
+    # spans velum -> tongue-back with evenly spaced gridlines that cannot cross or run
+    # past the tongue-back anchor, and always land on the rear wall. Falls back to the
+    # median tongue-bottom point only if the ratio is unavailable.
+    ftb = float(f_tb) if (f_tb is not None and np.isfinite(f_tb)) else None
+    if ftb is not None:
+        i_v = _split_index(R, p_vel)
+        i_tb = _split_index(R, _point_at_fraction(R, ftb))
+        i_tb = max(i_tb, i_v + 2)  # tongue-back is posterior to the velum
+        if 2 <= i_tb < len(R):
+            R = R[: i_tb + 1]  # clip rear wall at the firm tongue-back ratio
+    else:
+        tb = np.asarray(tb, np.float32)
+        ref_tb = (
+            np.array([np.nanmedian(tb[:, 0]), np.nanmedian(tb[:, 1])], np.float32)
+            if np.isfinite(tb).any()
+            else ref_floor[-1]
+        )
+        if np.all(np.isfinite(ref_tb)):
+            wi = int(((R - ref_tb[None, :]) ** 2).sum(1).argmin())
+            if wi >= 2:
+                R = R[: wi + 1]
+    i_ru = _split_index(R, p_vel)  # velum split on the (clipped) rear wall
     i_rf = _split_index(F, R[i_ru])
     k_o = n + 2
     k_p = (n + 1) if even_total else (n + 2)
@@ -1428,6 +1351,7 @@ def _utterance_anchors(regions, T, jaw_ref):
     walls = []
     f_raw = np.full(T, np.nan, np.float32)
     tb_raw = np.full((T, 2), np.nan, np.float32)
+    ftb_raw = np.full(T, np.nan, np.float32)  # tongue-back anchor as a rear-wall ratio
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
         ra = _roof_airway(reg_up)
@@ -1446,17 +1370,38 @@ def _utterance_anchors(regions, T, jaw_ref):
             _, f_raw[t], _ = _project_to_polyline(roof, vcent)
         if floor is not None and len(floor) >= 2:
             tb_raw[t] = floor[-1]
+        # Tongue-back anchor as a rear-wall arc RATIO (the mirror of the velum
+        # fraction): take the TONGUE-MASK pixel closest to the pharyngeal-wall bottom
+        # (its inferior-posterior corner — a mask-wide minimum, so a curled-under
+        # contour never moves it) and project it onto the roof-airway boundary to get
+        # its arc fraction. The firm per-clip median of this ratio fixes the posterior
+        # end of the pharyngeal cavity on the rear wall, exactly like the velum split.
+        tongue_m = reg_up.get(TONGUE_SUB)
+        if (
+            ra is not None
+            and len(ra) >= 3
+            and tongue_m is not None
+            and np.asarray(tongue_m).any()
+            and np.all(np.isfinite(w_low_s[t]))
+        ):
+            ys, xs = np.where(np.asarray(tongue_m))
+            tp = np.stack([xs, ys], 1).astype(np.float32) / UPSCALE
+            tbp = tp[int(((tp - w_low_s[t][None, :]) ** 2).sum(1).argmin())]
+            _, ftb_raw[t], _ = _project_to_polyline(ra, tbp)
     # Combat velum-mask dropouts/fragmentation and terminus glitches: carry the
     # previous position through transient jumps before firming.
     f_raw = _hold_jumps(f_raw, JUMP_THRESH.get("frac", 0.15))
     tb_raw = _hold_jumps(tb_raw, JUMP_THRESH.get("px", 10.0))
+    ftb_raw = _hold_jumps(ftb_raw, JUMP_THRESH.get("frac", 0.15))
     if VELUM_ANCHOR == "median":
         fm = float(np.nanmedian(f_raw)) if np.isfinite(f_raw).any() else np.nan
         f_vel = np.full(T, fm, np.float64)  # NaN -> midline_grid falls back to 0.5
     else:  # "smooth"
         f_vel = stabilize(f_raw, msize, sig)
     tb = stabilize(tb_raw, msize, sig)
-    return walls, f_vel, tb
+    # Tongue-back is always a FIRM per-clip ratio (one anchor for the whole file).
+    f_tb = float(np.nanmedian(ftb_raw)) if np.isfinite(ftb_raw).any() else np.nan
+    return walls, f_vel, tb, f_tb
 
 
 def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, contours=None):
@@ -1464,20 +1409,7 @@ def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, co
     When `fixed_grid` is provided (grid_method='fixed'), measure both walls against
     the raw mask contours."""
     if fixed_grid is not None:
-        vtd, r, f, a_idx = measure_fixed_grid(contours, fixed_grid)
-        # GUARANTEE the tongue-back anchor connects the tongue back to the rear wall.
-        # `build_roof` ends on the rear wall exactly at the tongue-back connection and
-        # `build_floor` ends at the tongue back (a mutual-closest tongue/wall pair), so
-        # pin the last anchor to those two endpoints. A curled-under backside bends
-        # away from the wall and can never be that pair, so the anchor can never float
-        # off the rear wall. This also drives `_trim_roof_to_last`, so the drawn rear
-        # wall stops at the connection (not the wall bottom).
-        if roof is not None and floor is not None and len(roof) >= 1 and len(floor) >= 1:
-            k = a_idx[-1]
-            r[k] = np.asarray(roof[-1], np.float32)
-            f[k] = np.asarray(floor[-1], np.float32)
-            vtd[k] = float(np.linalg.norm(r[k] - f[k]))
-        return vtd, r, f, a_idx
+        return measure_fixed_grid(contours, fixed_grid)
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
@@ -1526,7 +1458,7 @@ def _frame_walls(regions, t, jaw_ref, w_low=None):
         reg_up[sub] = smooth_mask(m[t]) if (m is not None and t < m.shape[0]) else None
     jaw_up = (jaw_ref[0] * UPSCALE, jaw_ref[1] * UPSCALE) if jaw_ref else None
     return (
-        build_roof(reg_up, w_low=w_low),
+        build_roof(reg_up),
         build_floor(reg_up, jaw_up, w_low=w_low),
         _velum_lower_center(reg_up),
         reg_up,
@@ -1714,9 +1646,9 @@ def write_diagnostic_video(
         str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (fw, fh)
     )
     # Same anchors/grid as the output (e.g. the fixed per-clip grid).
-    walls, f_vel, tb = _utterance_anchors(regions, T, jaw_ref)
+    walls, f_vel, tb, f_tb = _utterance_anchors(regions, T, jaw_ref)
     fixed_grid = (
-        build_fixed_grid(walls, f_vel, tb, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+        build_fixed_grid(walls, f_vel, tb, f_tb, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
         if GRID_METHOD == "fixed"
         else None
     )
@@ -1824,11 +1756,11 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         )
         # Pass 1: trace walls + derive the velum split fraction and tongue-bottom,
         # per VELUM_ANCHOR (median = one firm fraction per clip) / ANCHOR_SMOOTH.
-        walls, f_vel, tb = _utterance_anchors(regions, T, jaw_ref)
+        walls, f_vel, tb, f_tb = _utterance_anchors(regions, T, jaw_ref)
         # grid_method='fixed': build one fixed grid for the whole clip from the
         # median walls; per frame only the boundary crossings move.
         fixed_grid = (
-            build_fixed_grid(walls, f_vel, tb, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+            build_fixed_grid(walls, f_vel, tb, f_tb, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
             if GRID_METHOD == "fixed"
             else None
         )
@@ -1901,9 +1833,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         else None
     )
     ti = T // 2
-    walls_d, f_vel_d, tb_d = _utterance_anchors(regions, T, jaw_ref)
+    walls_d, f_vel_d, tb_d, f_tb_d = _utterance_anchors(regions, T, jaw_ref)
     fixed_grid_d = (
-        build_fixed_grid(walls_d, f_vel_d, tb_d, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+        build_fixed_grid(walls_d, f_vel_d, tb_d, f_tb_d, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
         if GRID_METHOD == "fixed"
         else None
     )
