@@ -496,37 +496,99 @@ def _wall_bottom_up(reg_up, w_low=None):
     return np.array([float(wx[i]), float(wy[i])], np.float32)
 
 
-def _tongue_backside(tongue_mask, w_low=None):
-    """Posterior/backside edge of the tongue: the contour arc from the right-most
-    point (root) to the tongue-contour point CLOSEST to the pharyngeal-wall bottom
-    `w_low` (the tongue's inferior-posterior corner). Terminating at that point —
-    rather than the tongue's own geometric max-y — is what lets the backside reach
-    the true bottom instead of being cut short: the descent past the wall-facing
-    corner curls to lower x, so an x-based cut deletes it. Falls back to the
-    bottom-most pixel when `w_low` is None. Taken on the higher-x (wall-facing)
-    side, oriented root -> terminus. Returns (K,2) upscaled or None."""
+def _tongue_back_branch(tongue_mask, w_low=None):
+    """Return an ordered root->posterior branch and its safe stop fraction."""
     core = _largest_component(tongue_mask.astype(bool)).astype(np.uint8)
     cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cs:
-        return None
+        return None, None, np.nan
     pts = max(cs, key=len).squeeze()
     if pts.ndim != 2 or len(pts) < 4:
-        return None
-    root = int(pts[:, 0].argmax())  # right-most (tongue root)
-    if w_low is not None:
-        end = int(((pts - np.asarray(w_low, np.float32)[None, :]) ** 2).sum(1).argmin())
+        return None, None, np.nan
+    root = int(pts[:, 0].argmax())
+    n = len(pts)
+    half = max(2, n // 2)
+
+    def walk(step):
+        idx = (root + step * np.arange(half + 1)) % n
+        return pts[idx].astype(np.float32)
+
+    branch_pos, branch_neg = walk(1), walk(-1)
+    if w_low is not None and np.all(np.isfinite(w_low)):
+        target = np.asarray(w_low, np.float32)
+        root_pt = branch_pos[0]
+        axis = target - root_pt
+        norm = float(np.linalg.norm(axis))
+        if norm > 1e-6:
+            axis /= norm
+
+            def progress(branch):
+                proj = ((branch - root_pt[None, :]) * axis[None, :]).sum(1)
+                k = min(12, len(proj))
+                return float(np.mean(proj[1:k])) if k > 1 else float(proj[-1])
+
+            branch = branch_pos if progress(branch_pos) >= progress(branch_neg) else branch_neg
+            proj = ((branch - root_pt[None, :]) * axis[None, :]).sum(1)
+            max_proj = float(np.max(proj))
+            candidates = np.where(proj >= max(1.0, 0.40 * max_proj))[0]
+            if len(candidates) == 0:
+                candidates = np.arange(1, len(branch))
+            d2 = ((branch - target[None, :]) ** 2).sum(1)
+            end = int(candidates[int(d2[candidates].argmin())])
+        else:
+            branch = branch_pos if branch_pos[:, 0].mean() >= branch_neg[:, 0].mean() else branch_neg
+            end = int(((branch - target[None, :]) ** 2).sum(1).argmin())
     else:
-        end = int(pts[:, 1].argmax())  # fallback: bottom-most pixel
-    if root == end:
+        branch = branch_pos if branch_pos[:, 1].mean() >= branch_neg[:, 1].mean() else branch_neg
+        end = int(branch[:, 1].argmax())
+
+    end = min(max(end, 1), len(branch) - 1)
+    cum = _cumarc(branch)
+    frac = float(cum[end] / cum[-1]) if cum[-1] > 0 else np.nan
+    return branch, end, frac
+
+
+def _tongue_backside(tongue_mask, w_low=None, tongue_fraction=None):
+    """Trace the ordered wall-facing tongue branch to a safe or stabilized stop.
+
+    With `tongue_fraction=None`, the stop is the current contour point nearest the
+    stabilized wall-bottom target. With a fraction, the point moves smoothly with
+    the tongue but is clamped to that frame's safe wall-nearest stop.
+    """
+    branch, safe_end, raw_frac = _tongue_back_branch(tongue_mask, w_low)
+    if branch is None or safe_end is None:
         return None
-    a, b = sorted([root, end])
-    arc1 = pts[a : b + 1]
-    arc2 = np.concatenate([pts[b:], pts[: a + 1]])
-    arc = arc1 if arc1[:, 0].mean() >= arc2[:, 0].mean() else arc2  # posterior side
-    # Orient root -> terminus (robust to the terminus being above or below root).
-    if ((arc[0] - pts[root]) ** 2).sum() > ((arc[-1] - pts[root]) ** 2).sum():
-        arc = arc[::-1]
-    return arc.astype(np.float32)
+    frac = raw_frac
+    if tongue_fraction is not None and np.isfinite(tongue_fraction):
+        # A smoothed ratio may move the anchor, but never beyond this frame's
+        # wall-nearest safe stop and into the under-curl.
+        frac = min(float(np.clip(tongue_fraction, 0.0, 1.0)), raw_frac)
+    cum = _cumarc(branch)
+    target_s = float(np.clip(frac, 0.0, 1.0)) * cum[-1]
+    end = int(np.abs(cum - target_s).argmin())
+    end = min(max(end, 1), safe_end)
+    return branch[: end + 1].astype(np.float32)
+
+
+def _tongue_back_anchor(reg_up, w_low=None):
+    """Return the raw tongue anchor, wall counterpart, and branch arc fraction."""
+    tongue = reg_up.get(TONGUE_SUB)
+    if tongue is None or not np.asarray(tongue).any():
+        return None, None, np.nan
+    branch, safe_end, frac = _tongue_back_branch(
+        np.asarray(tongue).astype(np.uint8), _wall_bottom_up(reg_up, w_low)
+    )
+    if branch is None or safe_end is None:
+        return None, None, np.nan
+    tongue_pt = branch[safe_end].astype(np.float32)
+    wall_pt = None
+    wall = reg_up.get(PHARYNX_SUB)
+    if wall is not None and np.asarray(wall).any():
+        wall_edge = _left_edge(np.asarray(wall).astype(np.uint8))
+        if wall_edge is not None and len(wall_edge):
+            i = int(((wall_edge - tongue_pt[None, :]) ** 2).sum(1).argmin())
+            wall_pt = wall_edge[i].astype(np.float32)
+    return tongue_pt, wall_pt, frac
 
 
 def _tongue_dorsum(mask_up, jaw_ref_up=None):
@@ -566,7 +628,7 @@ def _tongue_dorsum(mask_up, jaw_ref_up=None):
     return upper.astype(np.float32)
 
 
-def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
+def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None, tongue_fraction=None):
     """Floor traced from the actual mask CONTOURS, per region (no lip/tongue union
     skyline). lip aperture -> lower-lip top -> bridge -> tongue dorsum (contour) ->
     tongue backside (contour) to the pharyngeal terminus. Each segment follows its
@@ -612,7 +674,7 @@ def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
     parts.append(dorsum)
 
     backside = _tongue_backside(
-        tongue, _wall_bottom_up(reg_up, w_low)
+        tongue, _wall_bottom_up(reg_up, w_low), tongue_fraction=tongue_fraction
     )  # root -> terminus
     if backside is not None and len(backside) >= 1:
         parts.append(backside[1:] if len(backside) > 1 else backside)  # drop dup root
@@ -621,7 +683,7 @@ def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None):
     return _smooth_path(line, SIGMA_PATH)
 
 
-def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None):
+def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None, tongue_fraction=None):
     """One line, front -> back, in original coords: a single airway-facing upper
     edge from the lip through the tongue, then down the tongue backside.
 
@@ -637,7 +699,7 @@ def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None):
     tongue surfaces the skyline flattens; falls back to this skyline path if the
     contour trace fails."""
     if FLOOR_FRONT == "contour":
-        _line = _build_floor_contour(reg_up, jaw_ref_up, w_low)
+        _line = _build_floor_contour(reg_up, jaw_ref_up, w_low, tongue_fraction)
         if _line is not None:
             return _line
     U = UPSCALE
@@ -672,7 +734,9 @@ def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None):
     # closest to the pharyngeal-wall bottom (its inferior-posterior corner), so it
     # reaches the true bottom instead of being cut short. That terminus is also the
     # posterior VTD anchor, keeping the tongue-back and rear-wall endpoints aligned.
-    backside = _tongue_backside(tongue, _wall_bottom_up(reg_up, w_low))
+    backside = _tongue_backside(
+        tongue, _wall_bottom_up(reg_up, w_low), tongue_fraction=tongue_fraction
+    )
     if backside is not None and len(backside) >= 1:
         parts.append(backside)
 
@@ -1147,7 +1211,7 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     }
 
 
-def measure_fixed_grid(contours, grid):
+def measure_fixed_grid(contours, grid, tongue_bottom=None):
     """Measure VTD for one frame against a FIXED grid. BOTH walls are measured the
     same way: for each fixed gridline, the raw-mask-contour crossing nearest that
     gridline's reference point (Rref for the roof, Fref for the floor). No traced
@@ -1161,11 +1225,55 @@ def measure_fixed_grid(contours, grid):
     floor_pts = np.full((L, 2), np.nan, np.float32)
     rc = contours.get("roof") if contours else None
     fc = contours.get("floor") if contours else None
+    vel_idx = a_idx[1]
+    prev_r = prev_f = 0.0
     for i in range(L):
         r_ref = Rref[i] if Rref is not None else O[i]
         f_ref = Fref[i] if Fref is not None else O[i]
-        roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
-        floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
+        if i >= vel_idx and rc:
+            roof_pts[i], prev_r = _ordered_contour_hit(
+                O[i], N[i], rc, r_ref, prev_r
+            )
+            if roof_pts[i] is None:
+                roof_pts[i], prev_r = r_ref, prev_r
+        else:
+            roof_pts[i] = _contour_hit(O[i], N[i], rc, r_ref) if rc else r_ref
+        if (
+            i == a_idx[-1]
+            and tongue_bottom is not None
+            and np.all(np.isfinite(tongue_bottom))
+        ):
+            floor_pts[i] = np.asarray(tongue_bottom, np.float32)
+        else:
+            if i >= vel_idx and fc:
+                floor_pts[i], prev_f = _ordered_contour_hit(
+                    O[i], N[i], fc, f_ref, prev_f
+                )
+                if floor_pts[i] is None:
+                    floor_pts[i], prev_f = f_ref, prev_f
+            else:
+                floor_pts[i] = _contour_hit(O[i], N[i], fc, f_ref) if fc else f_ref
+
+    # If a highly concave frame still makes posterior connectors cross, replace
+    # that posterior correspondence with monotonic arc-paired wall points.  The
+    # terminal floor point remains the stabilized tongue anchor.
+    crossed = any(
+        _segments_cross(roof_pts[i], floor_pts[i], roof_pts[j], floor_pts[j])
+        for i in range(vel_idx, L)
+        for j in range(i + 1, L)
+    )
+    if crossed and rc and fc:
+        rline, fline = rc[0], fc[0]
+        ri = int(((rline - roof_pts[vel_idx][None, :]) ** 2).sum(1).argmin())
+        fi = int(((fline - floor_pts[vel_idx][None, :]) ** 2).sum(1).argmin())
+        k = L - vel_idx
+        rtail = _resample(rline[ri:], k)
+        ftail = _resample(fline[fi:], k)
+        if rtail is not None and ftail is not None:
+            roof_pts[vel_idx:] = rtail
+            floor_pts[vel_idx:] = ftail
+            if tongue_bottom is not None and np.all(np.isfinite(tongue_bottom)):
+                floor_pts[-1] = np.asarray(tongue_bottom, np.float32)
     vtd = np.linalg.norm(roof_pts - floor_pts, axis=1).astype(np.float32)
     return vtd, roof_pts, floor_pts, a_idx
 
@@ -1230,7 +1338,7 @@ def _roof_airway(reg_up):
     return _smooth_path(line, SIGMA_PATH)
 
 
-def _floor_airway(reg_up):
+def _floor_airway(reg_up, w_low=None, tongue_fraction=None):
     """Airway-facing floor boundary (the floor twin of `_roof_airway`): the smooth
     UPPER ENVELOPE of the tongue(+lower-lip) from the lip aperture back to the tongue
     root, then the tongue backside for the curl. The upper envelope (per-column top
@@ -1267,7 +1375,11 @@ def _floor_airway(reg_up):
             elif not np.allclose(front[0], ap):
                 front = np.vstack([ap[None, :], front])
     parts = [front]
-    backside = _tongue_backside(tb.astype(np.uint8), None)  # root -> tongue bottom (curl)
+    backside = _tongue_backside(
+        tb.astype(np.uint8),
+        _wall_bottom_up(reg_up, w_low),
+        tongue_fraction=tongue_fraction,
+    )  # root -> stabilized tongue-back stop
     if backside is not None and len(backside) >= 1:
         parts.append(backside[1:] if len(backside) > 1 else backside)
     line = np.concatenate(parts, axis=0) / UPSCALE
@@ -1298,12 +1410,59 @@ def _contour_hit(origin, nrm, contours, ref_pt):
     return best if best is not None else near_pt
 
 
+def _ordered_contour_hit(origin, nrm, contours, ref_pt, min_frac=0.0):
+    """Hit a contour while preserving forward arc order from `min_frac`."""
+    ref = np.asarray(ref_pt, np.float32)
+    best, best_d, best_frac = None, np.inf, float(min_frac)
+    near_pt, near_d = None, np.inf
+    for C in contours:
+        C = np.asarray(C, np.float32)
+        cum = _cumarc(C)
+        total = cum[-1]
+        ts, pts = _line_crossings(origin, nrm, C)
+        if pts is not None and total > 0:
+            idx = ((C[None, :, :] - pts[:, None, :]) ** 2).sum(2).argmin(1)
+            fr = cum[idx] / total
+            ok = fr >= float(min_frac) - 1e-5
+            if ok.any():
+                valid = np.where(ok)[0]
+                d = np.sqrt(((pts[valid] - ref[None, :]) ** 2).sum(1))
+                j = int(valid[int(d.argmin())])
+                if float(d.min()) < best_d:
+                    best_d, best, best_frac = float(d.min()), pts[j], float(fr[j])
+        dd = ((C - ref[None, :]) ** 2).sum(1)
+        jj = int(dd.argmin())
+        if dd[jj] < near_d:
+            near_d, near_pt = float(dd[jj]), C[jj]
+    if best is not None:
+        return best.astype(np.float32), best_frac
+    return near_pt.astype(np.float32) if near_pt is not None else None, float(min_frac)
+
+
+def _segments_cross(a, b, c, d, eps=1e-5):
+    """Return whether two closed 2-D segments intersect."""
+    a, b, c, d = [np.asarray(p, np.float64) for p in (a, b, c, d)]
+
+    def cross(u, v):
+        return float(u[0] * v[1] - u[1] * v[0])
+
+    def orient(p, q, r):
+        return cross(q - p, r - p)
+
+    o1, o2 = orient(a, b, c), orient(a, b, d)
+    o3, o4 = orient(c, d, a), orient(c, d, b)
+    proper = ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and (
+        (o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)
+    )
+    return bool(proper)
+
+
 def _utterance_anchors(regions, T, jaw_ref):
     """Trace walls for every frame of one utterance and derive the velum split
     fraction and tongue-bottom anchor, honoring VELUM_ANCHOR / ANCHOR_SMOOTH.
 
     Returns (walls, f_vel, tb): walls[t] = (roof, floor, vel_c); f_vel (T,) is the
-    velum split as a roof-arc fraction; tb (T,2) the tongue-bottom point.
+    velum split as a roof-arc fraction; tb (T,2) the stabilized tongue-bottom point.
 
     VELUM_ANCHOR == "median" gives ONE firm split fraction for the whole clip — the
     median of the per-frame roof-arc fractions. Because the fraction is measured
@@ -1337,10 +1496,11 @@ def _utterance_anchors(regions, T, jaw_ref):
     walls = []
     f_raw = np.full(T, np.nan, np.float32)
     tb_raw = np.full((T, 2), np.nan, np.float32)
+    f_tb_raw = np.full(T, np.nan, np.float32)
     for t in range(T):
         roof, floor, vel_c, reg_up = _frame_walls(regions, t, jaw_ref, w_low=w_low_s[t])
         ra = _roof_airway(reg_up)
-        fa = _floor_airway(reg_up)
+        fa = _floor_airway(reg_up, w_low=w_low_s[t])
         cont = {
             # floor: airway upper envelope (lip -> tongue, smooth, no curl under) +
             # tongue backside for the curl. Traces the lip edge; no front crossing.
@@ -1348,6 +1508,7 @@ def _utterance_anchors(regions, T, jaw_ref):
             # roof: raw palate/lip front (stable lip) + velum bottom to its bottom-most
             # point + straight bridge to the wall.
             "roof": [ra] if (ra is not None and len(ra) >= 2) else None,
+            "_reg_up": reg_up,
         }
         walls.append((roof, floor, vel_c, cont))
         vcent = _velum_centroid(reg_up)
@@ -1355,25 +1516,71 @@ def _utterance_anchors(regions, T, jaw_ref):
             _, f_raw[t], _ = _project_to_polyline(roof, vcent)
         if floor is not None and len(floor) >= 2:
             tb_raw[t] = floor[-1]
+        tongue_pt, _wall_pt, f_tb_raw[t] = _tongue_back_anchor(
+            reg_up, w_low=w_low_s[t]
+        )
+        if tongue_pt is not None:
+            tb_raw[t] = tongue_pt / UPSCALE
     # Combat velum-mask dropouts/fragmentation and terminus glitches: carry the
     # previous position through transient jumps before firming.
     f_raw = _hold_jumps(f_raw, JUMP_THRESH.get("frac", 0.15))
     tb_raw = _hold_jumps(tb_raw, JUMP_THRESH.get("px", 10.0))
+    f_tb_raw = _hold_jumps(f_tb_raw, JUMP_THRESH.get("frac", 0.15))
     if VELUM_ANCHOR == "median":
         fm = float(np.nanmedian(f_raw)) if np.isfinite(f_raw).any() else np.nan
         f_vel = np.full(T, fm, np.float64)  # NaN -> midline_grid falls back to 0.5
     else:  # "smooth"
         f_vel = stabilize(f_raw, msize, sig)
+    f_tb = stabilize(f_tb_raw, msize, sig)
     tb = stabilize(tb_raw, msize, sig)
+
+    # Rebuild the floor paths from the stabilized tongue arc ratio.  The ratio is
+    # allowed to move with the tongue, but each frame is clamped to its own
+    # wall-nearest safe stop so a smoothed trajectory cannot enter an under-curl.
+    jaw_up = (jaw_ref[0] * UPSCALE, jaw_ref[1] * UPSCALE) if jaw_ref else None
+    for t, (roof, floor, vel_c, cont) in enumerate(walls):
+        reg_up = cont.get("_reg_up")
+        if reg_up is None:
+            continue
+        frac = f_tb[t] if np.isfinite(f_tb[t]) else None
+        floor = build_floor(
+            reg_up, jaw_up, w_low=w_low_s[t], tongue_fraction=frac
+        )
+        fa = _floor_airway(
+            reg_up, w_low=w_low_s[t], tongue_fraction=frac
+        )
+        cont["floor"] = [fa] if (fa is not None and len(fa) >= 2) else None
+        anchor_arc = _tongue_backside(
+            reg_up[TONGUE_SUB],
+            _wall_bottom_up(reg_up, w_low_s[t]),
+            tongue_fraction=frac,
+        ) if reg_up.get(TONGUE_SUB) is not None else None
+        if anchor_arc is not None and len(anchor_arc):
+            anchor = anchor_arc[-1].astype(np.float32) / UPSCALE
+            if floor is not None and len(floor) >= 2:
+                floor[-1] = anchor
+            if fa is not None and len(fa) >= 2:
+                fa[-1] = anchor
+            tb[t] = anchor
+        walls[t] = (roof, floor, vel_c, cont)
     return walls, f_vel, tb
 
 
-def _grid_with_anchors(roof, floor, vel_c, f_vel_t, tb_t, n, fixed_grid=None, contours=None):
+def _grid_with_anchors(
+    roof,
+    floor,
+    vel_c,
+    f_vel_t,
+    tb_t,
+    n,
+    fixed_grid=None,
+    contours=None,
+):
     """Single-frame VTD for the configured grid method using precomputed anchors.
     When `fixed_grid` is provided (grid_method='fixed'), measure both walls against
     the raw mask contours."""
     if fixed_grid is not None:
-        return measure_fixed_grid(contours, fixed_grid)
+        return measure_fixed_grid(contours, fixed_grid, tb_t)
     if GRID_METHOD == "midline":
         return midline_grid(roof, floor, f_vel_t, tb_t, n, EVEN_TOTAL, RECENTER_ITERS)
     if (
