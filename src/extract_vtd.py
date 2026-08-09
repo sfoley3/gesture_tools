@@ -92,6 +92,7 @@ _DEFAULT_CFG = {
     "upscale": 1,  # 1 = fast (trace raw mask, smooth the line); >1 = anti-alias masks
     "pre_sigma": 1.5,
     "sigma_path": 2.0,  # Gaussian smoothing of the derived line (pixels)
+    "sigma_backside": 0.5,  # lighter smoothing for the tongue posterior contour
     "even_total": False,  # False -> 2n+3 grid lines (odd, default: n=5 -> 13); True -> 2n+2
     "grid_method": "arc",  # {arc, midline}. arc = index-to-index (legacy); midline = normal cross-sections
     "norm_method": "minmax",  # {minmax, zscore} per-speaker per-grid-line normalization
@@ -133,6 +134,7 @@ N_BINS = int(_cfg.get("n_bins", 20))
 UPSCALE = int(_cfg.get("upscale", 1))
 PRE_SIGMA = float(_cfg.get("pre_sigma", 1.5))
 SIGMA_PATH = float(_cfg.get("sigma_path", 2.0))
+SIGMA_BACKSIDE = float(_cfg.get("sigma_backside", 0.5))
 EVEN_TOTAL = bool(_cfg.get("even_total", False))
 GRID_METHOD = str(_cfg.get("grid_method", "arc"))
 NORM_METHOD = str(_cfg.get("norm_method", "minmax"))
@@ -374,6 +376,28 @@ def _smooth_path(line, sigma):
     return out
 
 
+def _smooth_floor_line(line, posterior_start):
+    """Smooth the floor normally, but preserve the mask-facing backside edge.
+
+    The front floor and all roof paths retain the established ``SIGMA_PATH``
+    smoothing.  The tongue posterior is a special case: heavier smoothing can
+    pull an inward-curving contour away from the actual mask edge, so that tail
+    receives only the small backside sigma and keeps its terminal pixel exact.
+    """
+    out = _smooth_path(line, SIGMA_PATH)
+    if out is None or len(out) < 3:
+        return out
+    if posterior_start >= len(line):
+        return out
+    start = int(np.clip(posterior_start, 0, len(line) - 1))
+    if len(line) - start >= 3 and SIGMA_BACKSIDE > 0:
+        tail = _smooth_path(line[start:], SIGMA_BACKSIDE)
+        if tail is not None:
+            out[start:] = tail
+    out[-1] = line[-1]
+    return out
+
+
 def _resample(line, n):
     """Arc-length resample an (M,2) polyline to exactly n points. Returns (n,2)."""
     if line is None or len(line) < 2:
@@ -497,49 +521,52 @@ def _wall_bottom_up(reg_up, w_low=None):
 
 
 def _tongue_back_branch(tongue_mask, w_low=None):
-    """Return an ordered root->posterior branch and its safe stop fraction."""
-    core = _largest_component(tongue_mask.astype(bool)).astype(np.uint8)
-    cs, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cs:
-        return None, None, np.nan
-    pts = max(cs, key=len).squeeze()
-    if pts.ndim != 2 or len(pts) < 4:
-        return None, None, np.nan
-    root = int(pts[:, 0].argmax())
-    n = len(pts)
-    half = max(2, n // 2)
+    """Return the mask's outer root->posterior branch and safe stop fraction.
 
-    def walk(step):
-        idx = (root + step * np.arange(half + 1)) % n
-        return pts[idx].astype(np.float32)
+    The old contour walk could choose the wrong half of a curled contour and
+    cut inward across the tongue.  The posterior boundary is single-valued in
+    image rows for this purpose, so use the rightmost mask pixel in each row as
+    the wall-facing edge.  This deliberately excludes the portion that curls
+    underneath the tongue instead of trying to smooth that ambiguity away.
+    """
+    core = _largest_component(tongue_mask.astype(bool))
+    ys, xs = np.where(core)
+    if len(xs) < 4:
+        return None, None, np.nan
 
-    branch_pos, branch_neg = walk(1), walk(-1)
+    # Start at the uppermost row containing the rightmost tongue pixel: this is
+    # the tongue root, then descend along the outer posterior edge.
+    root_x = int(xs.max())
+    root_y = int(ys[xs == root_x].min())
+    rows = np.unique(ys[ys >= root_y])
+    branch = np.stack(
+        [np.asarray([xs[ys == y].max() for y in rows], dtype=np.float32),
+         rows.astype(np.float32)],
+        axis=1,
+    )
+    if len(branch) < 2:
+        return None, None, np.nan
+
     if w_low is not None and np.all(np.isfinite(w_low)):
         target = np.asarray(w_low, np.float32)
-        root_pt = branch_pos[0]
+        root_pt = branch[0]
         axis = target - root_pt
         norm = float(np.linalg.norm(axis))
         if norm > 1e-6:
             axis /= norm
-
-            def progress(branch):
-                proj = ((branch - root_pt[None, :]) * axis[None, :]).sum(1)
-                k = min(12, len(proj))
-                return float(np.mean(proj[1:k])) if k > 1 else float(proj[-1])
-
-            branch = branch_pos if progress(branch_pos) >= progress(branch_neg) else branch_neg
             proj = ((branch - root_pt[None, :]) * axis[None, :]).sum(1)
             max_proj = float(np.max(proj))
-            candidates = np.where(proj >= max(1.0, 0.40 * max_proj))[0]
+            candidates = np.where(
+                (np.arange(len(branch)) > 0)
+                & (proj >= max(1.0, 0.40 * max_proj))
+            )[0]
             if len(candidates) == 0:
                 candidates = np.arange(1, len(branch))
             d2 = ((branch - target[None, :]) ** 2).sum(1)
             end = int(candidates[int(d2[candidates].argmin())])
         else:
-            branch = branch_pos if branch_pos[:, 0].mean() >= branch_neg[:, 0].mean() else branch_neg
             end = int(((branch - target[None, :]) ** 2).sum(1).argmin())
     else:
-        branch = branch_pos if branch_pos[:, 1].mean() >= branch_neg[:, 1].mean() else branch_neg
         end = int(branch[:, 1].argmax())
 
     end = min(max(end, 1), len(branch) - 1)
@@ -673,14 +700,18 @@ def _build_floor_contour(reg_up, jaw_ref_up=None, w_low=None, tongue_fraction=No
                     parts.append(br)
     parts.append(dorsum)
 
+    posterior_start = None
     backside = _tongue_backside(
         tongue, _wall_bottom_up(reg_up, w_low), tongue_fraction=tongue_fraction
     )  # root -> terminus
     if backside is not None and len(backside) >= 1:
         parts.append(backside[1:] if len(backside) > 1 else backside)  # drop dup root
+        posterior_start = sum(len(part) for part in parts[:-1])
 
     line = np.concatenate(parts, axis=0) / UPSCALE
-    return _smooth_path(line, SIGMA_PATH)
+    if posterior_start is None:
+        posterior_start = len(line)
+    return _smooth_floor_line(line, posterior_start)
 
 
 def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None, tongue_fraction=None):
@@ -741,7 +772,7 @@ def build_floor(reg_up: dict, jaw_ref_up=None, w_low=None, tongue_fraction=None)
         parts.append(backside)
 
     line = np.concatenate(parts, axis=0) / U
-    return _smooth_path(line, SIGMA_PATH)
+    return _smooth_floor_line(line, len(front))
 
 
 # ── VTD ──────────────────────────────────────────────────────────────────────
@@ -1383,7 +1414,7 @@ def _floor_airway(reg_up, w_low=None, tongue_fraction=None):
     if backside is not None and len(backside) >= 1:
         parts.append(backside[1:] if len(backside) > 1 else backside)
     line = np.concatenate(parts, axis=0) / UPSCALE
-    return _smooth_path(line, SIGMA_PATH)
+    return _smooth_floor_line(line, len(front))
 
 
 def _contour_hit(origin, nrm, contours, ref_pt):
