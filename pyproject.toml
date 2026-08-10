@@ -23,6 +23,8 @@ dependencies = [
 extract-mask-kinematics = "extract_mask_kinematics:main"
 get-tongue-contours = "get_tongue_contours:main"
 extract-vtd = "extract_vtd:main"
+plot-vtd-variability = "plot_vtd_variability:main"
+report-vtd-variability = "report_vtd_variability:main"
 
 # The modules import each other as top-level names (e.g.
 # `from extract_mask_kinematics import extract_kinematics`), so they are
@@ -33,6 +35,8 @@ py-modules = [
     "extract_mask_kinematics",
     "get_tongue_contours",
     "extract_vtd",
+    "plot_vtd_variability",
+    "report_vtd_variability",
     "plot_tongue",
     "ssanova",
     "get_tt_region",
