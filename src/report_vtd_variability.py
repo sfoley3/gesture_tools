@@ -189,17 +189,21 @@ def speaker_records(
     split: str,
     source: str,
     expected_L: int | None,
+    speaker_subdir: str | None = None,
 ) -> tuple[list[dict], dict]:
     records = []
     info = {
         "source": source,
+        "search_root": str(root / speaker_subdir) if speaker_subdir else str(root),
+        "session": session,
         "requested_speakers": list(speakers),
         "missing_speakers": [],
         "missing_vtd_directories": [],
         "n_utterances": 0,
     }
+    speaker_root = root / speaker_subdir if speaker_subdir else root
     for speaker in speakers:
-        base = root / speaker / session if session else root / speaker
+        base = speaker_root / speaker / session if session else speaker_root / speaker
         if not base.is_dir():
             info["missing_speakers"].append(speaker)
             continue
@@ -242,6 +246,7 @@ def lss_records(
     vtd_dir = resolve_vtd_dir(base, vtd_dir_name, value_kind, preferred_vtd_dir)
     info = {
         "source": source,
+        "search_root": str(root),
         "requested_stems": len(stems),
         "missing_stems": [],
         "n_utterances": 0,
@@ -283,8 +288,10 @@ def all_speaker_records(
     split: str,
     source: str,
     expected_L: int | None,
+    speaker_subdir: str | None = None,
 ) -> tuple[list[dict], dict]:
-    speakers = discover_speakers(root, session)
+    speaker_root = root / speaker_subdir if speaker_subdir else root
+    speakers = discover_speakers(speaker_root, session)
     records, info = speaker_records(
         root,
         speakers,
@@ -295,6 +302,7 @@ def all_speaker_records(
         split,
         source,
         expected_L,
+        speaker_subdir=speaker_subdir,
     )
     info["discovered_speakers"] = speakers
     return records, info
@@ -486,6 +494,7 @@ def collect_report(cfg: dict, args) -> dict:
             "test",
             "prompt_adults",
             expected_L,
+            speaker_subdir="mri",
         )
         info["split_file"] = str(test_path)
         add("test", records, info)
@@ -521,6 +530,7 @@ def collect_report(cfg: dict, args) -> dict:
                 split,
                 "prompt",
                 expected_L,
+                speaker_subdir="mri",
             )
             info["split_file"] = str(path)
             add(split, records, info)
@@ -685,6 +695,19 @@ def main() -> None:
             f"{split:>5}: {s.get('n_utterances', 0):5d} utterances, "
             f"{s.get('n_speakers', 0):3d} speakers, {s.get('n_frames', 0):8d} frames"
         )
+    if not any(report["splits"].get(split, {}).get("n_utterances", 0) for split in ("train", "val", "test")):
+        print("No VTD targets were found. Collection diagnostics:")
+        for split, infos in report.get("collection", {}).items():
+            for info in infos:
+                missing = (
+                    info.get("missing_speakers", [])
+                    + info.get("missing_vtd_directories", [])
+                    + info.get("missing_stems", [])
+                )
+                print(
+                    f"  {split}/{info.get('source')}: search_root={info.get('search_root')} "
+                    f"session={info.get('session')} missing={len(missing)}"
+                )
 
 
 if __name__ == "__main__":
