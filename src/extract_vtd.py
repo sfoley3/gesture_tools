@@ -76,7 +76,13 @@ matplotlib.use("Agg")
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import gaussian_filter, gaussian_filter1d, label, median_filter
+from scipy.ndimage import (
+    distance_transform_edt,
+    gaussian_filter,
+    gaussian_filter1d,
+    label,
+    median_filter,
+)
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
@@ -107,6 +113,7 @@ _DEFAULT_CFG = {
     "jump_thresh": {"frac": 0.15, "px": 10.0},  # anchor jump limits: velum fraction / position (px). carry-forward on jump or dropout
     "fixed_window": 0.15,  # grid_method=fixed: arc-fraction window for the per-frame local floor-crossing search
     "session": None,  # session subdir for longitudinal data ({spk}/{session}/...); None = flat
+    "velum_min_area_ratio": 0.5,  # velum frame is a dropout if its area < ratio * speaker reference area (0 = no repair)
 }
 
 
@@ -145,6 +152,7 @@ VELUM_ANCHOR = str(_cfg.get("velum_anchor", "median"))
 WALL_BOTTOM = str(_cfg.get("wall_bottom", "median"))
 JUMP_THRESH = dict(_cfg.get("jump_thresh", {"frac": 0.15, "px": 10.0}))
 FIXED_WINDOW = float(_cfg.get("fixed_window", 0.15))
+VELUM_MIN_AREA_RATIO = float(_cfg.get("velum_min_area_ratio", 0.5))
 MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
@@ -174,6 +182,75 @@ def _largest_component(mask: np.ndarray) -> np.ndarray:
     sizes = np.bincount(labeled.ravel())
     sizes[0] = 0
     return labeled == sizes.argmax()
+
+
+# ── Velum dropout repair ─────────────────────────────────────────────────────
+
+
+def _velum_areas(velum: np.ndarray) -> np.ndarray:
+    """(T,H,W) bool velum masks -> (T,) pixel area of each frame's largest component."""
+    return np.array([_largest_component(m).sum() for m in velum], np.float64)
+
+
+def _velum_reference(mask_files):
+    """Speaker-level velum reference for dropout repair, streamed over all clips.
+    Returns (ref_area, ref_mask): ref_area is the 90th percentile of per-frame velum
+    area (robust even when most frames are dropouts); ref_mask is the pixel-wise
+    majority velum over the frames that pass the area test (fallback shape for a
+    clip with no usable frame). (0.0, None) when there is nothing to repair with."""
+
+    def stacks():
+        for mp in mask_files:
+            data = np.load(mp)
+            k = _find_mask_key(list(data.keys()), VELUM_SUB)
+            if k is not None:
+                yield data[k].astype(bool)
+
+    areas = [_velum_areas(v) for v in stacks()]
+    ref_area = float(np.percentile(np.concatenate(areas), 90)) if areas else 0.0
+    if VELUM_MIN_AREA_RATIO <= 0 or ref_area <= 0:
+        return 0.0, None
+    count, n_good = None, 0
+    for v, a in zip(stacks(), areas):
+        good = a >= VELUM_MIN_AREA_RATIO * ref_area
+        if good.any():
+            c = v[good].sum(0)
+            count = c if count is None else count + c
+            n_good += int(good.sum())
+    return ref_area, count >= 0.5 * n_good
+
+
+def _signed_dist(mask: np.ndarray) -> np.ndarray:
+    """Signed distance to the mask boundary: positive inside, negative outside."""
+    return distance_transform_edt(mask) - distance_transform_edt(~mask)
+
+
+def _fill_velum(velum: np.ndarray, ref_area: float, ref_mask):
+    """Repair velum-mask dropouts in one clip. A frame is a dropout when its velum
+    area is below VELUM_MIN_AREA_RATIO * ref_area. Dropouts between two good frames
+    get a shape interpolated between them (signed-distance blend); dropouts before
+    the first / after the last good frame copy the nearest good mask; a clip with no
+    good frame uses the speaker reference mask. Returns (velum, filled (T,) bool)."""
+    filled = np.zeros(len(velum), bool)
+    if ref_mask is None:
+        return velum, filled
+    good = _velum_areas(velum) >= VELUM_MIN_AREA_RATIO * ref_area
+    if good.all():
+        return velum, filled
+    out = velum.copy()
+    gi = np.flatnonzero(good)
+    if len(gi) == 0:
+        out[:] = ref_mask
+        return out, ~good
+    out[: gi[0]] = velum[gi[0]]
+    out[gi[-1] + 1 :] = velum[gi[-1]]
+    for a, b in zip(gi[:-1], gi[1:]):
+        if b - a > 1:
+            sa, sb = _signed_dist(velum[a]), _signed_dist(velum[b])
+            for t in range(a + 1, b):
+                w = (t - a) / (b - a)
+                out[t] = ((1 - w) * sa + w * sb) > 0
+    return out, ~good
 
 
 def smooth_mask(
@@ -1939,18 +2016,35 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
                 "floor_front": FLOOR_FRONT,
                 "velum_anchor": VELUM_ANCHOR,
                 "wall_bottom": WALL_BOTTOM,
+                "velum_min_area_ratio": VELUM_MIN_AREA_RATIO,
             },
             fh,
             indent=2,
         )
 
+    # Velum dropout repair: speaker reference, then per-clip fill at load time.
+    ref_area, ref_mask = _velum_reference(mask_files)
+
+    def load_regions(mask_path):
+        regions, T = _load_regions(mask_path)
+        filled = np.zeros(T, bool)
+        if regions[VELUM_SUB] is not None:
+            regions[VELUM_SUB], filled = _fill_velum(
+                regions[VELUM_SUB], ref_area, ref_mask
+            )
+        return regions, T, filled
+
     per_video = {}  # basename -> (mask_path, video_path, T)
     all_vtd = []
+    n_frames = n_filled = n_ref_clips = 0
     for mp in tqdm(mask_files, desc=f"  {label} VTD"):
         basename = mp.stem
-        regions, T = _load_regions(mp)
+        regions, T, filled = load_regions(mp)
         if T == 0:
             continue
+        n_frames += T
+        n_filled += int(filled.sum())
+        n_ref_clips += int(filled.all())
         jaw_ref = (
             _find_jaw_anchor(regions[TONGUE_SUB], regions[LOWER_LIP_SUB])
             if regions[TONGUE_SUB] is not None and regions[LOWER_LIP_SUB] is not None
@@ -1977,12 +2071,24 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
             )
             vtd[t], roof_pts[t], floor_pts[t] = v, r, f
         np.save(out_dir / "pts" / f"{basename}.npy", vtd)
-        np.savez(out_dir / "lines" / f"{basename}.npz", roof=roof_pts, floor=floor_pts)
+        np.savez(
+            out_dir / "lines" / f"{basename}.npz",
+            roof=roof_pts,
+            floor=floor_pts,
+            velum_filled=filled,
+        )
         vpath = video_dir / f"{basename}.avi"
         if not vpath.exists():
             print(f"  Warning: video not found for {basename}: {vpath}")
         per_video[basename] = (mp, vpath if vpath.exists() else None, T)
         all_vtd.append(vtd)
+
+    if n_frames:
+        print(
+            f"  {label}: velum repaired on {n_filled}/{n_frames} frames "
+            f"({100 * n_filled / n_frames:.1f}%); "
+            f"{n_ref_clips} clips used the speaker reference velum"
+        )
 
     if not all_vtd:
         return
@@ -2028,7 +2134,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     names = list(per_video.keys())
     dbase = rng_r.choice(names)
     mp, vpath, T = per_video[dbase]
-    regions, _ = _load_regions(mp)
+    regions, _, _ = load_regions(mp)
     jaw_ref = (
         _find_jaw_anchor(regions[TONGUE_SUB], regions[LOWER_LIP_SUB])
         if regions[TONGUE_SUB] is not None and regions[LOWER_LIP_SUB] is not None
@@ -2063,7 +2169,7 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         rng_r.sample(names, min(n_videos, len(names))), desc=f"  {label} diag videos"
     ):
         mp, vpath, T = per_video[basename]
-        regions, _ = _load_regions(mp)
+        regions, _, _ = load_regions(mp)
         jaw_ref = (
             _find_jaw_anchor(regions[TONGUE_SUB], regions[LOWER_LIP_SUB])
             if regions[TONGUE_SUB] is not None and regions[LOWER_LIP_SUB] is not None
