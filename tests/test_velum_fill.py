@@ -88,13 +88,14 @@ class VelumFillTest(unittest.TestCase):
                 f = Path(d) / f"clip{i}.npz"
                 np.savez(f, **{"velum": v, "tongue": v})
                 files.append(f)
-            ref_area, ref_mask = ev._velum_reference(files)
+            ref_area, ref_mask, n_bad = ev._velum_reference(files)
             self.assertEqual(ref_area, float(blob(17).sum()))
             np.testing.assert_array_equal(ref_mask, blob(17))
+            self.assertEqual(list(n_bad), [0, 0, 0] + [10] * 7)
             old = ev.VELUM_MIN_AREA_RATIO
             try:
                 ev.VELUM_MIN_AREA_RATIO = 0.0
-                self.assertEqual(ev._velum_reference(files), (0.0, None))
+                self.assertEqual(ev._velum_reference(files)[:2], (0.0, None))
             finally:
                 ev.VELUM_MIN_AREA_RATIO = old
 

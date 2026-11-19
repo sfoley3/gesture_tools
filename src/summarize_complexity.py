@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Print per-speaker mean ± std for MCI and NINFL."""
 
-import json
 from pathlib import Path
 import numpy as np
+from gt_config import CONFIG_HELP, load_config
 
 # ── Load config ─────────────────────────────────────────────────────────────
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
-with open(_CONFIG_PATH) as _f:
-    _cfg = json.load(_f)
+_cfg = load_config()
 
 DATA_DIR  = Path(_cfg["data_dir"])
 SPK_BASE  = _cfg.get("spk_base", "")

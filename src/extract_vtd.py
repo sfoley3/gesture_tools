@@ -65,7 +65,6 @@ line count, and the anchor indices [lips, velum, tongue_back].
 
 import argparse
 import json
-import os
 import random
 import sys
 from pathlib import Path
@@ -85,6 +84,7 @@ from scipy.ndimage import (
 )
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+from gt_config import CONFIG_HELP, load_config
 
 # ── Config (same pattern as the other gesture_tools scripts) ─────────────────
 _DEFAULT_CFG = {
@@ -110,27 +110,17 @@ _DEFAULT_CFG = {
     "floor_front": "skyline",  # {skyline, contour} tongue/lip surface tracing for the floor
     "velum_anchor": "median",  # {median, smooth} velum split: per-video median fraction (firm) vs per-frame smoothed
     "wall_bottom": "median",  # {median, smooth} pharyngeal-wall bottom (tongue-back terminus ref): firm vs smoothed
-    "jump_thresh": {"frac": 0.15, "px": 10.0},  # anchor jump limits: velum fraction / position (px). carry-forward on jump or dropout
+    "jump_thresh": {
+        "frac": 0.15,
+        "px": 10.0,
+    },  # anchor jump limits: velum fraction / position (px). carry-forward on jump or dropout
     "fixed_window": 0.15,  # grid_method=fixed: arc-fraction window for the per-frame local floor-crossing search
     "session": None,  # session subdir for longitudinal data ({spk}/{session}/...); None = flat
     "velum_min_area_ratio": 0.5,  # velum frame is a dropout if its area < ratio * speaker reference area (0 = no repair)
 }
 
 
-def _load_config() -> dict:
-    candidates = []
-    env_path = os.environ.get("GESTURE_TOOLS_CONFIG")
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.append(Path(__file__).resolve().parent.parent / "config.json")
-    for candidate in candidates:
-        if candidate.is_file():
-            with open(candidate) as _f:
-                return {**_DEFAULT_CFG, **json.load(_f)}
-    return dict(_DEFAULT_CFG)
-
-
-_cfg = _load_config()
+_cfg = load_config(_DEFAULT_CFG)
 DATA_DIR = Path(_cfg["data_dir"])
 N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 5))
 SPK_BASE = _cfg.get("spk_base", "")
@@ -153,6 +143,8 @@ WALL_BOTTOM = str(_cfg.get("wall_bottom", "median"))
 JUMP_THRESH = dict(_cfg.get("jump_thresh", {"frac": 0.15, "px": 10.0}))
 FIXED_WINDOW = float(_cfg.get("fixed_window", 0.15))
 VELUM_MIN_AREA_RATIO = float(_cfg.get("velum_min_area_ratio", 0.5))
+N_UTTS = None  # --n-utts: test run on the N clips per speaker with the most velum dropouts
+OUT_NAME = None  # --out-name: output dir name; None = vtd_{grid_method}_{norm_method}
 MAX_XY = 104  # mask side length (used as a ray-length cap)
 
 # Region key substrings (case-insensitive). Five segmented regions; no larynx.
@@ -194,30 +186,32 @@ def _velum_areas(velum: np.ndarray) -> np.ndarray:
 
 def _velum_reference(mask_files):
     """Speaker-level velum reference for dropout repair, streamed over all clips.
-    Returns (ref_area, ref_mask): ref_area is the 90th percentile of per-frame velum
-    area (robust even when most frames are dropouts); ref_mask is the pixel-wise
-    majority velum over the frames that pass the area test (fallback shape for a
-    clip with no usable frame). (0.0, None) when there is nothing to repair with."""
+    Returns (ref_area, ref_mask, n_bad): ref_area is the 90th percentile of
+    per-frame velum area (robust even when most frames are dropouts); ref_mask is
+    the pixel-wise majority velum over the frames that pass the area test (fallback
+    shape for a clip with no usable frame); n_bad[i] is the number of dropout frames
+    in mask_files[i]. (0.0, None, zeros) when there is nothing to repair with."""
 
-    def stacks():
+    def stacks():  # one (T,H,W) bool array per file; T = 0 when it has no velum
         for mp in mask_files:
             data = np.load(mp)
             k = _find_mask_key(list(data.keys()), VELUM_SUB)
-            if k is not None:
-                yield data[k].astype(bool)
+            yield data[k].astype(bool) if k is not None else np.zeros((0, 1, 1), bool)
 
     areas = [_velum_areas(v) for v in stacks()]
+    n_bad = np.zeros(len(areas), int)
     ref_area = float(np.percentile(np.concatenate(areas), 90)) if areas else 0.0
     if VELUM_MIN_AREA_RATIO <= 0 or ref_area <= 0:
-        return 0.0, None
+        return 0.0, None, n_bad
     count, n_good = None, 0
-    for v, a in zip(stacks(), areas):
+    for i, (v, a) in enumerate(zip(stacks(), areas)):
         good = a >= VELUM_MIN_AREA_RATIO * ref_area
+        n_bad[i] = int((~good).sum())
         if good.any():
             c = v[good].sum(0)
             count = c if count is None else count + c
             n_good += int(good.sum())
-    return ref_area, count >= 0.5 * n_good
+    return ref_area, count >= 0.5 * n_good, n_bad
 
 
 def _signed_dist(mask: np.ndarray) -> np.ndarray:
@@ -617,8 +611,10 @@ def _tongue_back_branch(tongue_mask, w_low=None):
     root_y = int(ys[xs == root_x].min())
     rows = np.unique(ys[ys >= root_y])
     branch = np.stack(
-        [np.asarray([xs[ys == y].max() for y in rows], dtype=np.float32),
-         rows.astype(np.float32)],
+        [
+            np.asarray([xs[ys == y].max() for y in rows], dtype=np.float32),
+            rows.astype(np.float32),
+        ],
         axis=1,
     )
     if len(branch) < 2:
@@ -634,8 +630,7 @@ def _tongue_back_branch(tongue_mask, w_low=None):
             proj = ((branch - root_pt[None, :]) * axis[None, :]).sum(1)
             max_proj = float(np.max(proj))
             candidates = np.where(
-                (np.arange(len(branch)) > 0)
-                & (proj >= max(1.0, 0.40 * max_proj))
+                (np.arange(len(branch)) > 0) & (proj >= max(1.0, 0.40 * max_proj))
             )[0]
             if len(candidates) == 0:
                 candidates = np.arange(1, len(branch))
@@ -1114,7 +1109,11 @@ def _local_crossing(origin, nrm, poly, cum, s_ref, window):
     on the polyline when the line misses locally."""
     ts, pts = _line_crossings(origin, nrm, poly)
     if pts is None:
-        return _point_at_fraction(poly, s_ref) if s_ref is not None else _nearest_on(poly, origin)
+        return (
+            _point_at_fraction(poly, s_ref)
+            if s_ref is not None
+            else _nearest_on(poly, origin)
+        )
     if s_ref is None:
         return pts[0]
     fr = np.array([_frac_of(poly, cum, p) for p in pts])
@@ -1259,12 +1258,16 @@ def build_fixed_grid(walls, f_vel, tb, n, even_total=False, recenter_iters=1, m=
     roofs = [
         _resample(w[3]["roof"][0], m)
         for w in walls
-        if w[3].get("roof") and w[3]["roof"][0] is not None and len(w[3]["roof"][0]) >= 2
+        if w[3].get("roof")
+        and w[3]["roof"][0] is not None
+        and len(w[3]["roof"][0]) >= 2
     ]
     floors = [
         _resample(w[3]["floor"][0], m)
         for w in walls
-        if w[3].get("floor") and w[3]["floor"][0] is not None and len(w[3]["floor"][0]) >= 2
+        if w[3].get("floor")
+        and w[3]["floor"][0] is not None
+        and len(w[3]["floor"][0]) >= 2
     ]
     roofs = [r for r in roofs if r is not None]
     floors = [f for f in floors if f is not None]
@@ -1339,9 +1342,7 @@ def measure_fixed_grid(contours, grid, tongue_bottom=None):
         r_ref = Rref[i] if Rref is not None else O[i]
         f_ref = Fref[i] if Fref is not None else O[i]
         if i >= vel_idx and rc:
-            roof_pts[i], prev_r = _ordered_contour_hit(
-                O[i], N[i], rc, r_ref, prev_r
-            )
+            roof_pts[i], prev_r = _ordered_contour_hit(O[i], N[i], rc, r_ref, prev_r)
             if roof_pts[i] is None:
                 roof_pts[i], prev_r = r_ref, prev_r
         else:
@@ -1399,12 +1400,16 @@ def _region_contours(reg_up, subs):
             union = mb if union is None else (union | mb)
     if union is None or not union.any():
         return None
-    cs, _ = cv2.findContours(union.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cs, _ = cv2.findContours(
+        union.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
     out = []
     for c in cs:
         pts = c.squeeze()
         if pts.ndim == 2 and len(pts) >= 3:
-            out.append((np.vstack([pts, pts[0]]).astype(np.float32)) / UPSCALE)  # closed
+            out.append(
+                (np.vstack([pts, pts[0]]).astype(np.float32)) / UPSCALE
+            )  # closed
     return out or None
 
 
@@ -1418,7 +1423,9 @@ def _roof_airway(reg_up):
     palate = reg_up.get(ROOF_FRONT_SUB)
     if palate is None or not np.asarray(palate).any():
         return None
-    pal = _bottom_edge(np.asarray(palate).astype(np.uint8))  # airway-facing, ascending x
+    pal = _bottom_edge(
+        np.asarray(palate).astype(np.uint8)
+    )  # airway-facing, ascending x
     if pal is None or len(pal) < 2:
         return None
     parts = [pal]
@@ -1428,11 +1435,15 @@ def _roof_airway(reg_up):
         vel = _bottom_edge(np.asarray(velum).astype(np.uint8))
         if len(vel) >= 2:
             i, j = _closest_pair(pal, vel)  # splice palate <-> velum where they meet
-            bot = int(vel[:, 1].argmax())  # ACTUAL bottom-most (max-y) velum flesh point
+            bot = int(
+                vel[:, 1].argmax()
+            )  # ACTUAL bottom-most (max-y) velum flesh point
             velseg = vel[j : bot + 1] if bot >= j else vel[bot : j + 1][::-1]
             if len(velseg) >= 1:
                 parts = [pal[: i + 1], velseg]
-                tail = vel[bot]  # bridge starts from the true bottom point (not the curl)
+                tail = vel[
+                    bot
+                ]  # bridge starts from the true bottom point (not the curl)
     wall = reg_up.get(PHARYNX_SUB)
     if wall is not None and np.asarray(wall).any():
         wl = _left_edge(np.asarray(wall).astype(np.uint8))  # airway edge, ascending y
@@ -1471,7 +1482,12 @@ def _floor_airway(reg_up, w_low=None, tongue_fraction=None):
     front = front[front[:, 0] <= root_x + 0.5]  # up to the tongue root
     # Start at the lip aperture (drop the external lip front outside the tract).
     upper_lip = reg_up.get(ROOF_FRONT_SUB)
-    if upper_lip is not None and np.asarray(upper_lip).any() and lower is not None and np.asarray(lower).any():
+    if (
+        upper_lip is not None
+        and np.asarray(upper_lip).any()
+        and lower is not None
+        and np.asarray(lower).any()
+    ):
         ub = _bottom_edge(np.asarray(upper_lip).astype(np.uint8))
         lt = _top_edge(np.asarray(lower).astype(np.uint8))
         if len(ub) and len(lt):
@@ -1624,9 +1640,7 @@ def _utterance_anchors(regions, T, jaw_ref):
             _, f_raw[t], _ = _project_to_polyline(roof, vcent)
         if floor is not None and len(floor) >= 2:
             tb_raw[t] = floor[-1]
-        tongue_pt, _wall_pt, f_tb_raw[t] = _tongue_back_anchor(
-            reg_up, w_low=w_low_s[t]
-        )
+        tongue_pt, _wall_pt, f_tb_raw[t] = _tongue_back_anchor(reg_up, w_low=w_low_s[t])
         if tongue_pt is not None:
             tb_raw[t] = tongue_pt / UPSCALE
     # Combat velum-mask dropouts/fragmentation and terminus glitches: carry the
@@ -1651,18 +1665,18 @@ def _utterance_anchors(regions, T, jaw_ref):
         if reg_up is None:
             continue
         frac = f_tb[t] if np.isfinite(f_tb[t]) else None
-        floor = build_floor(
-            reg_up, jaw_up, w_low=w_low_s[t], tongue_fraction=frac
-        )
-        fa = _floor_airway(
-            reg_up, w_low=w_low_s[t], tongue_fraction=frac
-        )
+        floor = build_floor(reg_up, jaw_up, w_low=w_low_s[t], tongue_fraction=frac)
+        fa = _floor_airway(reg_up, w_low=w_low_s[t], tongue_fraction=frac)
         cont["floor"] = [fa] if (fa is not None and len(fa) >= 2) else None
-        anchor_arc = _tongue_backside(
-            reg_up[TONGUE_SUB],
-            _wall_bottom_up(reg_up, w_low_s[t]),
-            tongue_fraction=frac,
-        ) if reg_up.get(TONGUE_SUB) is not None else None
+        anchor_arc = (
+            _tongue_backside(
+                reg_up[TONGUE_SUB],
+                _wall_bottom_up(reg_up, w_low_s[t]),
+                tongue_fraction=frac,
+            )
+            if reg_up.get(TONGUE_SUB) is not None
+            else None
+        )
         if anchor_arc is not None and len(anchor_arc):
             anchor = anchor_arc[-1].astype(np.float32) / UPSCALE
             if floor is not None and len(floor) >= 2:
@@ -1947,8 +1961,14 @@ def write_diagnostic_video(
         )
         # Draw the actual boundaries the points are measured against (airway roof/
         # floor) in fixed mode, not the build_roof/build_floor traces.
-        roof_draw = cont["roof"][0] if (fixed_grid is not None and cont.get("roof")) else roof
-        floor_draw = cont["floor"][0] if (fixed_grid is not None and cont.get("floor")) else floor
+        roof_draw = (
+            cont["roof"][0] if (fixed_grid is not None and cont.get("roof")) else roof
+        )
+        floor_draw = (
+            cont["floor"][0]
+            if (fixed_grid is not None and cont.get("floor"))
+            else floor
+        )
         _draw_overlay_bgr(canvas, regions, t, roof_draw, floor_draw, r, f, scale, a_idx)
         writer.write(canvas)
     if cap is not None:
@@ -1988,11 +2008,11 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     session = SESSION if SESSION is not None else ""
     mask_dir = base / session / "sam_seg" / "masks"
     video_dir = base / session / VIDEO_DIR
-    out_dir = base / session / f"vtd_{GRID_METHOD}_{NORM_METHOD}"
+    out_dir = base / session / (OUT_NAME or f"vtd_{GRID_METHOD}_{NORM_METHOD}")
 
     pattern = "*.npz"
     mask_files = sorted(mask_dir.glob(pattern))
-    # mask_files = mask_files[:2]
+    # mask_files = mask_files[:5]
     if not mask_files:
         print(f"  No mask files in {mask_dir}")
         return
@@ -2023,7 +2043,10 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
         )
 
     # Velum dropout repair: speaker reference, then per-clip fill at load time.
-    ref_area, ref_mask = _velum_reference(mask_files)
+    ref_area, ref_mask, n_bad = _velum_reference(mask_files)
+    if N_UTTS:  # test run: only the clips with the most velum-dropout frames
+        worst = np.argsort(-n_bad, kind="stable")[:N_UTTS]
+        mask_files = [mask_files[i] for i in sorted(worst)]
 
     def load_regions(mask_path):
         regions, T = _load_regions(mask_path)
@@ -2143,7 +2166,9 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     ti = T // 2
     walls_d, f_vel_d, tb_d = _utterance_anchors(regions, T, jaw_ref)
     fixed_grid_d = (
-        build_fixed_grid(walls_d, f_vel_d, tb_d, n_gridlines, EVEN_TOTAL, RECENTER_ITERS)
+        build_fixed_grid(
+            walls_d, f_vel_d, tb_d, n_gridlines, EVEN_TOTAL, RECENTER_ITERS
+        )
         if GRID_METHOD == "fixed"
         else None
     )
@@ -2151,8 +2176,12 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
     _, r, f, a_idx = _grid_with_anchors(
         roof, floor, vel_c, f_vel_d[ti], tb_d[ti], n_gridlines, fixed_grid_d, cont
     )
-    roof_draw = cont["roof"][0] if (fixed_grid_d is not None and cont.get("roof")) else roof
-    floor_draw = cont["floor"][0] if (fixed_grid_d is not None and cont.get("floor")) else floor
+    roof_draw = (
+        cont["roof"][0] if (fixed_grid_d is not None and cont.get("roof")) else roof
+    )
+    floor_draw = (
+        cont["floor"][0] if (fixed_grid_d is not None and cont.get("floor")) else floor
+    )
     save_static_diagnostic(
         out_dir / "diagnostic" / f"{label}_frame.pdf",
         regions,
@@ -2191,10 +2220,16 @@ def process_speaker(spk, n_gridlines, n_videos, n_bins):
 def main():
     global UPSCALE, PRE_SIGMA, SIGMA_PATH, EVEN_TOTAL
     global GRID_METHOD, NORM_METHOD, ANCHOR_SMOOTH, RECENTER_ITERS, SESSION, FLOOR_FRONT
-    global VELUM_ANCHOR, WALL_BOTTOM, FIXED_WINDOW
+    global VELUM_ANCHOR, WALL_BOTTOM, FIXED_WINDOW, OUT_NAME, N_UTTS
     single = not SPK_BASE
     p = argparse.ArgumentParser(
         description="Extract vocal-tract distance (VTD) from SAM2 masks."
+    )
+    p.add_argument("--config", default=None, help=CONFIG_HELP)
+    p.add_argument(
+        "--out-name",
+        default=None,
+        help="Output dir name under each speaker (default: vtd_{grid_method}_{norm_method}).",
     )
     if not single:
         p.add_argument(
@@ -2212,6 +2247,13 @@ def main():
         help="Interior lines per cavity (n). Total = 2n+2 (even) or 2n+3 (odd).",
     )
     p.add_argument("--n-videos", type=int, default=N_DIAGNOSTIC)
+    p.add_argument(
+        "--n-utts",
+        type=int,
+        default=None,
+        help="Test run: process only the N clips per speaker with the most "
+        "velum-dropout frames (speaker reference still uses every clip).",
+    )
     p.add_argument("--bins", type=int, default=N_BINS)
     p.add_argument("--upscale", type=int, default=UPSCALE)
     p.add_argument("--pre-sigma", type=float, default=PRE_SIGMA)
@@ -2293,6 +2335,8 @@ def main():
     VELUM_ANCHOR = args.velum_anchor
     WALL_BOTTOM = args.wall_bottom
     FIXED_WINDOW = args.fixed_window
+    OUT_NAME = args.out_name
+    N_UTTS = args.n_utts
 
     if single:
         print(f"\n[{DATA_DIR.name}] (single speaker)")

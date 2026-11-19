@@ -1,0 +1,21 @@
+{
+  "dataset": "longitudinal",
+  "data_dir": "/data1/span_data/longitudinal/data",
+  "spk_base": "ID",
+  "session": "D1A",
+  "video_dir": "video_split",
+  "audio_dir": "audio_split",
+  "n_diagnostic": 5,
+  "textgrid_dir": "",
+  "velum_processing": "pca",
+  "smooth": true,
+  "loess_span": 50,
+  "upscale": 1,
+  "pre_sigma": 1.5,
+  "sigma_path": 2.0,
+  "even_total": false,
+  "n_gridlines": 10,
+  "n_bins": 20,
+  "grid_method": "fixed",
+  "norm_method": "zscore"
+}

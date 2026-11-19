@@ -18,12 +18,11 @@ import cv2
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
+from gt_config import CONFIG_HELP, load_config
 
 
 # ── Load config ─────────────────────────────────────────────────────────────
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
-with open(_CONFIG_PATH) as _f:
-    _cfg = json.load(_f)
+_cfg = load_config()
 
 DATA_DIR  = Path(_cfg["data_dir"])
 SPK_BASE  = _cfg.get("spk_base", "")
@@ -326,6 +325,7 @@ def main():
         description="Plot a random MRI frame as a side-by-side PDF "
                     "(frame + regions + points | frame + regions + tongue contour)."
     )
+    parser.add_argument("--config", default=None, help=CONFIG_HELP)
     parser.add_argument("--output-dir", type=Path,
                         default=Path(os.path.join(DATA_DIR, "sam_seg")),
                         help="Directory to write the output PDF.")

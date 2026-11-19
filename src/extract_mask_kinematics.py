@@ -28,7 +28,6 @@ Usage:
 
 import argparse
 import json
-import os
 import random
 import sys
 from pathlib import Path
@@ -39,6 +38,7 @@ from scipy.ndimage import binary_erosion, label
 from sklearn.decomposition import PCA
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from tqdm import tqdm
+from gt_config import CONFIG_HELP, load_config
 
 # ── Load config ─────────────────────────────────────────────────────────────
 # Defaults let the module import cleanly when pip-installed (no repo-root
@@ -56,28 +56,7 @@ _DEFAULT_CFG = {
 }
 
 
-def _load_config() -> dict:
-    """Load config.json, falling back gracefully so imports never crash.
-
-    Search order:
-      1. Path in the GESTURE_TOOLS_CONFIG environment variable, if set.
-      2. config.json at the repo root (next to the package) — dev/clone layout.
-    Missing keys are filled from _DEFAULT_CFG; if no file is found the defaults
-    are used in full.
-    """
-    candidates = []
-    env_path = os.environ.get("GESTURE_TOOLS_CONFIG")
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.append(Path(__file__).resolve().parent.parent / "config.json")
-    for candidate in candidates:
-        if candidate.is_file():
-            with open(candidate) as _f:
-                return {**_DEFAULT_CFG, **json.load(_f)}
-    return dict(_DEFAULT_CFG)
-
-
-_cfg = _load_config()
+_cfg = load_config(_DEFAULT_CFG)
 
 DATA_DIR = Path(_cfg["data_dir"])
 N_DIAGNOSTIC = int(_cfg.get("n_diagnostic", 10))
@@ -930,6 +909,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract mask kinematics from SAM2 NPZ files."
     )
+    parser.add_argument("--config", default=None, help=CONFIG_HELP)
     if not single_speaker:
         parser.add_argument(
             "--spk",

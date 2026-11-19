@@ -53,6 +53,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+from gt_config import CONFIG_HELP, resolve_config
+
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config.json"
 
 
@@ -337,7 +339,7 @@ def analyze_speaker(speaker: str, vtd_dir: Path, point_metric: str) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ap.add_argument("--config", type=resolve_config, default=DEFAULT_CONFIG, help=CONFIG_HELP)
     ap.add_argument(
         "--data-root",
         type=Path,

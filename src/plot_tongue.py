@@ -20,7 +20,6 @@ Usage:
     python analysis/plot_tongue_contours.py
 """
 
-import json
 import os
 import sys
 from collections import defaultdict
@@ -35,12 +34,11 @@ from scipy.ndimage import gaussian_filter1d
 # ssanova.py lives in the same directory as this script
 sys.path.insert(0, str(Path(__file__).parent))
 from ssanova import compute_all as ssanova_compute_all
+from gt_config import CONFIG_HELP, load_config
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
-with open(_CONFIG_PATH) as _f:
-    _cfg = json.load(_f)
+_cfg = load_config()
 
 DATA_DIR = Path(_cfg["data_dir"])
 FIGS_DIR = DATA_DIR / "figs"

@@ -1,6 +1,22 @@
 # gesture_tools
 Analysis tools for working with rtMRI-derived video features for speech production research.
 
+## Dataset configs
+
+There is one config per dataset in `configs/`: `prompt.json`, `longitudinal.json`
+and `lss.json`. Every script takes `--config`, either a dataset name or a path to
+a JSON file:
+
+```text
+python src/extract_vtd.py --config prompt --spk 5 9
+python src/extract_mask_kinematics.py --config longitudinal
+python src/get_tongue_contours.py --config lss
+```
+
+Without `--config`, scripts use `$GESTURE_TOOLS_CONFIG` (name or path) and then
+`config.json` at the repo root. `report_vtd_variability.py` is the exception: its
+`--config` is the speech-inversion training config.
+
 ## VTD variability diagnostics
 
 `src/plot_vtd_variability.py` makes two per-speaker boxplots from the saved VTD

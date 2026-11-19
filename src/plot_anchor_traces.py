@@ -106,6 +106,7 @@ def _plot(basename, f_edge, f_cent, f_smooth, tbx, tbx_s, tby, tby_s, out_path):
 
 def main():
     p = argparse.ArgumentParser(description="Plot raw-vs-smoothed VTD anchor traces.")
+    p.add_argument("--config", default=None, help=ev.CONFIG_HELP)
     p.add_argument("--spk", default=None, help="Speaker dir name (e.g. ID16) or number.")
     p.add_argument("--session", default=ev.SESSION, help="Session subdir (longitudinal).")
     p.add_argument("--n-utts", type=int, default=4, help="Number of utterances to plot.")

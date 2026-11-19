@@ -40,6 +40,8 @@ import os
 
 import numpy as np
 
+from gt_config import resolve_config
+
 try:
     # scipy is already a dependency of the repo (see get_corr.py / requirements).
     from scipy.stats import chi2
@@ -291,8 +293,9 @@ def save_plot(points, ellipse, center, radius95, confidence, out_path,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", default="config.json",
-                   help="Config JSON providing data_dir (default: config.json).")
+    p.add_argument("--config", default="config.json", type=lambda v: str(resolve_config(v)),
+                   help="Config JSON providing data_dir: a name in configs/ (prompt, "
+                        "longitudinal, lss) or a path (default: config.json).")
     p.add_argument("--raw-dir", default=None,
                    help="Directory of raw kinematics JSON files. Overrides "
                         "{data_dir}/kinematics/raw.")

@@ -43,4 +43,5 @@ py-modules = [
     "ling_complexity",
     "summarize_complexity",
     "plot_pts_contour",
+    "gt_config",
 ]
